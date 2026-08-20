@@ -13,6 +13,8 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
 COPY --chown=app:app app ./app
+COPY --chown=app:app alembic.ini ./
+COPY --chown=app:app migrations ./migrations
 
 USER app
 EXPOSE 8000

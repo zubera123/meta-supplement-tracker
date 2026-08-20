@@ -11,6 +11,8 @@ No external-data integration is simulated. The Apify Actor supplies linked Insta
 - Typed domain models for brands, ads, social data, reviews, and candidates
 - Apify Actor discovery for active commercial ads in the UK, supported EU countries, USA, and Canada
 - Optional advertiser-page enrichment with linked Instagram username and follower count
+- PostgreSQL scan history with advertiser/ad upserts and follower observations
+- Alembic-managed database schema using SQLAlchemy 2.x and psycopg 3
 - Official Meta Ad Library API discovery retained as a UK/EU alternative
 - Cursor pagination, bounded transient retries, ad deduplication, and advertiser aggregation
 - Inclusive qualification filters for estimated monthly spend of $5,000–$30,000 and Instagram audiences of 10,000–100,000
@@ -74,6 +76,9 @@ Settings are loaded from environment variables and, for local development, `.env
 | `DESIRABLE_TRUSTPILOT_REVIEW_COUNT` | `300` |
 | `SCAN_INTERVAL_HOURS` | `12` |
 | `PROVIDER_RETRY_ATTEMPTS` | `3` |
+| `DATABASE_URL` | Required only when persistence is enabled; reference Railway PostgreSQL's `DATABASE_URL` |
+| `PERSIST_SCAN_RESULTS` | `false`; set to `true` to persist `--meta-only` scans |
+| `DATABASE_CONNECT_TIMEOUT_SECONDS` | `10`; fail-closed connection timeout before paid discovery starts |
 | `META_ACCESS_TOKEN` | Required only when `META_AD_PROVIDER=meta_ad_library` |
 | `META_AD_PROVIDER` | `apify` for the primary provider; `meta_ad_library` remains available |
 | `META_API_VERSION` | `v26.0`; update only after reviewing Meta's versioned documentation |
@@ -93,6 +98,45 @@ Settings are loaded from environment variables and, for local development, `.env
 | `GOOGLE_DOC_ID` | Target Google document ID |
 
 Never commit `.env`, credentials, or service-account files. The supplied `.gitignore` excludes them.
+
+## PostgreSQL persistence
+
+Persistence uses SQLAlchemy 2.x with the synchronous psycopg 3 dialect and Alembic migrations. Railway PostgreSQL exposes `DATABASE_URL` on the **database service**. Railway does not automatically copy that variable to the application service; add a reference variable to the application so it remains synchronized with the database credentials.
+
+The app accepts Railway's `postgres://` or `postgresql://` URL and changes only the SQLAlchemy driver scheme to `postgresql+psycopg://`. It does not parse, reconstruct, log, or store the credentials separately. SQLite is used only in isolated unit tests for behavior whose SQL semantics are compatible; runtime persistence rejects SQLite URLs.
+
+### Add PostgreSQL to the existing Railway project
+
+1. Open the existing Railway project and production environment.
+2. On the project canvas, click **+ New** (or use `Ctrl/Cmd + K`).
+3. Select **Database → PostgreSQL** and wait for the PostgreSQL service to become healthy.
+4. Open the `meta-supplement-tracker` application service, then open **Variables**.
+5. Click **Add Reference Variable** and select `DATABASE_URL` from the PostgreSQL service. If the service is named `Postgres`, Railway represents this as `DATABASE_URL=${{Postgres.DATABASE_URL}}`; use the actual service name shown in the project.
+6. Add `PERSIST_SCAN_RESULTS=true` to the application service.
+7. Deploy the resulting application variable changes. Do not expose the PostgreSQL service publicly; the referenced URL uses Railway private networking.
+
+Railway also creates `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, and `PGDATABASE` on the PostgreSQL service, but this app deliberately uses only the canonical `DATABASE_URL`. `DATABASE_PUBLIC_URL` is created only if database Public Access is enabled and is not needed by the deployed application.
+
+### Migrations and connectivity
+
+For a local PostgreSQL database, set `DATABASE_URL` in the untracked `.env` file and run:
+
+```bash
+alembic upgrade head
+python -m app.jobs.brand_scan --check-db
+```
+
+After this code is deployed and the Railway reference variable exists, apply and verify the migration inside the application container:
+
+```bash
+railway ssh -- alembic upgrade head
+railway ssh -- alembic current
+railway ssh -- python -m app.jobs.brand_scan --check-db
+```
+
+The connectivity command prints only `{"database": "reachable"}` and never prints the connection URL. Migrations are intentionally explicit rather than being run during every web-service startup.
+
+With persistence enabled, `python -m app.jobs.brand_scan --meta-only` verifies the database before any paid Apify Actor start. It creates a `scan_runs` row, upserts advertisers by Meta page ID and ads by Meta ad ID, writes one advertiser observation per scan, then marks the scan successful with its counts. Provider or persistence failures mark the scan failed when the database remains writable. An unavailable or missing database aborts clearly; results are never silently discarded. The JSON output includes the persisted scan-run ID.
 
 ## Apify Meta ads provider
 
@@ -164,6 +208,11 @@ A sanitised output shape is:
   "unique_advertisers": 1,
   "unique_ads": 2,
   "follower_filter": {"minimum": 10000, "maximum": 100000},
+  "persistence": {
+    "enabled": true,
+    "scan_run_id": 42,
+    "status": "succeeded"
+  },
   "advertisers": [
     {
       "facebook_page_name": "<page name>",
@@ -253,7 +302,7 @@ After configuring the authorised token, run:
 python -m app.jobs.brand_scan --meta-only
 ```
 
-This performs only Meta discovery. The official provider has no linked Instagram enrichment, so its follower status is unknown. It does not invoke a separate Instagram provider, reviews, Google Docs, scheduling, or fake data. Results use the same advertiser-summary JSON shape documented above.
+This performs only Meta discovery. The official provider has no linked Instagram enrichment, so its follower status is unknown. It does not invoke a separate Instagram provider, reviews, Google Docs, scheduling, or fake data. Results use the same advertiser-summary JSON shape documented above. When `PERSIST_SCAN_RESULTS=true`, the same normalized output is stored through the persistence service.
 
 
 ## Tests

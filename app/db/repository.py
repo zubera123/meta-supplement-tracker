@@ -1,0 +1,156 @@
+"""Repository operations for scan runs, advertisers, ads, and observations."""
+
+from datetime import datetime
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.db.models import Ad, Advertiser, AdvertiserObservation, ScanRun, utc_now
+from app.models import AdRecord, MetaAdDetails
+
+
+class ScanRepository:
+    """Perform persistence operations within a caller-owned transaction."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create_scan_run(
+        self, regions: list[str], *, started_at: datetime | None = None
+    ) -> ScanRun:
+        scan_run = ScanRun(
+            started_at=started_at or utc_now(),
+            status="running",
+            regions=regions,
+            ads_found=0,
+            advertisers_found=0,
+        )
+        self.session.add(scan_run)
+        self.session.flush()
+        return scan_run
+
+    def complete_scan_run(
+        self,
+        scan_run_id: int,
+        *,
+        ads_found: int,
+        advertisers_found: int,
+        finished_at: datetime | None = None,
+    ) -> ScanRun:
+        scan_run = self._scan_run(scan_run_id)
+        scan_run.status = "succeeded"
+        scan_run.finished_at = finished_at or utc_now()
+        scan_run.ads_found = ads_found
+        scan_run.advertisers_found = advertisers_found
+        scan_run.error_message = None
+        return scan_run
+
+    def fail_scan_run(
+        self,
+        scan_run_id: int,
+        error_message: str,
+        *,
+        finished_at: datetime | None = None,
+    ) -> ScanRun:
+        scan_run = self._scan_run(scan_run_id)
+        scan_run.status = "failed"
+        scan_run.finished_at = finished_at or utc_now()
+        scan_run.error_message = error_message[:4000]
+        return scan_run
+
+    def upsert_advertiser(self, record: AdRecord) -> Advertiser:
+        page_id = record.brand.source_id
+        advertiser: Advertiser | None = None
+        if page_id:
+            advertiser = self.session.scalar(
+                select(Advertiser).where(Advertiser.meta_page_id == page_id)
+            )
+        else:
+            advertiser = self.session.scalar(
+                select(Advertiser)
+                .where(Advertiser.meta_page_id.is_(None))
+                .where(Advertiser.page_name == record.brand.name)
+                .limit(1)
+            )
+
+        social = record.social_stats
+        followers = social.instagram_followers if social else None
+        username = (
+            social.instagram_handle if social and social.instagram_handle
+            else record.brand.instagram_handle
+        )
+        if advertiser is None:
+            advertiser = Advertiser(
+                meta_page_id=page_id,
+                page_name=record.brand.name,
+                instagram_username=username,
+                latest_instagram_followers=followers,
+                first_seen_at=record.observed_at,
+                last_seen_at=record.observed_at,
+            )
+            self.session.add(advertiser)
+            self.session.flush()
+            return advertiser
+
+        advertiser.page_name = record.brand.name
+        if username is not None:
+            advertiser.instagram_username = username
+        advertiser.latest_instagram_followers = followers
+        advertiser.last_seen_at = record.observed_at
+        return advertiser
+
+    def upsert_ad(
+        self, advertiser: Advertiser, ad_details: MetaAdDetails, *, seen_at: datetime
+    ) -> Ad:
+        ad = self.session.scalar(
+            select(Ad).where(Ad.meta_ad_id == ad_details.ad_id)
+        )
+        ad_text = next(
+            (body for body in ad_details.creative_bodies if body.strip()), None
+        )
+        if ad is None:
+            ad = Ad(
+                meta_ad_id=ad_details.ad_id,
+                advertiser_id=advertiser.id,
+                ad_start_date=ad_details.ad_delivery_start_time,
+                ad_text=ad_text,
+                snapshot_url=ad_details.ad_snapshot_url,
+                first_seen_at=seen_at,
+                last_seen_at=seen_at,
+            )
+            self.session.add(ad)
+            return ad
+
+        ad.advertiser_id = advertiser.id
+        ad.ad_start_date = ad_details.ad_delivery_start_time
+        ad.ad_text = ad_text
+        ad.snapshot_url = ad_details.ad_snapshot_url
+        ad.last_seen_at = seen_at
+        return ad
+
+    def write_advertiser_observation(
+        self,
+        advertiser: Advertiser,
+        scan_run_id: int,
+        record: AdRecord,
+    ) -> AdvertiserObservation:
+        followers = (
+            record.social_stats.instagram_followers
+            if record.social_stats is not None
+            else None
+        )
+        observation = AdvertiserObservation(
+            advertiser_id=advertiser.id,
+            scan_run_id=scan_run_id,
+            instagram_followers=followers,
+            active_ad_count=record.active_ad_count or 0,
+            observed_at=record.observed_at,
+        )
+        self.session.add(observation)
+        return observation
+
+    def _scan_run(self, scan_run_id: int) -> ScanRun:
+        scan_run = self.session.get(ScanRun, scan_run_id)
+        if scan_run is None:
+            raise ValueError(f"Scan run {scan_run_id} does not exist")
+        return scan_run

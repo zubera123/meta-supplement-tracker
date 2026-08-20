@@ -10,6 +10,11 @@ from typing import TypeVar
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from app.config import Settings, get_settings
+from app.db import (
+    DatabaseConfigurationError,
+    DatabasePersistenceError,
+    ScanPersistenceService,
+)
 from app.logging_config import configure_logging
 from app.models import AdRecord, Brand, BrandCandidate, ReviewStats, SocialStats
 from app.services import ProviderError, TransientProviderError
@@ -116,18 +121,55 @@ class BrandScanJob:
 
 
 async def _run_meta_only(settings: Settings) -> int:
+    persistence: ScanPersistenceService | None = None
+    scan_run_id: int | None = None
+    try:
+        if settings.persist_scan_results:
+            persistence = ScanPersistenceService.from_database_url(
+                settings.database_url,
+                connect_timeout_seconds=settings.database_connect_timeout_seconds,
+            )
+            # Fail before any paid provider call when persistence is required
+            # but the configured database is unavailable.
+            persistence.verify_connection()
+
+        provider = _build_meta_provider(settings)
+        if persistence is not None:
+            scan_run_id = persistence.create_scan_run(settings.regions)
+        records = await provider.retrieve_advertisers(
+            regions=settings.regions,
+            categories=settings.categories,
+        )
+        if persistence is not None and scan_run_id is not None:
+            persistence.persist_success(scan_run_id, records)
+        output = _build_meta_only_output(records, settings)
+        output["persistence"] = {
+            "enabled": persistence is not None,
+            "scan_run_id": scan_run_id,
+            "status": "succeeded" if persistence is not None else "disabled",
+        }
+        print(json.dumps(output, indent=2))
+        return 0
+    except Exception as exc:
+        if persistence is not None and scan_run_id is not None:
+            persistence.record_failure(scan_run_id, exc)
+        raise
+    finally:
+        if persistence is not None:
+            persistence.close()
+
+
+def _build_meta_provider(settings: Settings) -> MetaAdsProvider:
     configured_provider = (settings.meta_ad_provider or "meta_ad_library").casefold()
     if configured_provider == "apify":
-        provider: MetaAdsProvider = ApifyMetaAdsProvider(
+        return ApifyMetaAdsProvider(
             api_token=settings.apify_api_token,
             actor_id=settings.apify_actor_id,
             max_results_per_query=settings.apify_max_results_per_query,
             max_total_charge_usd_per_run=(
                 settings.apify_max_total_charge_usd_per_run
             ),
-            include_advertiser_details=(
-                settings.apify_include_advertiser_details
-            ),
+            include_advertiser_details=settings.apify_include_advertiser_details,
             monthly_budget_gbp=settings.apify_monthly_budget_gbp,
             budget_gbp_per_usd=settings.apify_budget_gbp_per_usd,
             request_timeout_seconds=settings.apify_request_timeout_seconds,
@@ -135,8 +177,8 @@ async def _run_meta_only(settings: Settings) -> int:
             retry_min_wait_seconds=settings.provider_retry_min_wait_seconds,
             retry_max_wait_seconds=settings.provider_retry_max_wait_seconds,
         )
-    elif configured_provider == "meta_ad_library":
-        provider = MetaAdLibraryProvider(
+    if configured_provider == "meta_ad_library":
+        return MetaAdLibraryProvider(
             access_token=settings.meta_access_token,
             api_version=settings.meta_api_version,
             request_timeout_seconds=settings.meta_request_timeout_seconds,
@@ -145,15 +187,21 @@ async def _run_meta_only(settings: Settings) -> int:
             retry_min_wait_seconds=settings.provider_retry_min_wait_seconds,
             retry_max_wait_seconds=settings.provider_retry_max_wait_seconds,
         )
-    else:
-        raise ProviderError(
-            f"Unsupported META_AD_PROVIDER for --meta-only: {settings.meta_ad_provider}"
-        )
-    records = await provider.retrieve_advertisers(
-        regions=settings.regions,
-        categories=settings.categories,
+    raise ProviderError(
+        f"Unsupported META_AD_PROVIDER for --meta-only: {settings.meta_ad_provider}"
     )
-    print(json.dumps(_build_meta_only_output(records, settings), indent=2))
+
+
+def _check_database(settings: Settings) -> int:
+    persistence = ScanPersistenceService.from_database_url(
+        settings.database_url,
+        connect_timeout_seconds=settings.database_connect_timeout_seconds,
+    )
+    try:
+        persistence.verify_connection()
+    finally:
+        persistence.close()
+    print(json.dumps({"database": "reachable"}))
     return 0
 
 
@@ -204,21 +252,31 @@ def _build_meta_only_output(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Meta Supplement Tracker scan utilities")
-    parser.add_argument(
+    commands = parser.add_mutually_exclusive_group(required=True)
+    commands.add_argument(
         "--meta-only",
         action="store_true",
         help="Run documented Meta Ad Library discovery without other enrichments",
     )
+    commands.add_argument(
+        "--check-db",
+        action="store_true",
+        help="Verify DATABASE_URL connectivity without running a scan",
+    )
     args = parser.parse_args()
-    if not args.meta_only:
-        parser.error("Only --meta-only is available until the remaining providers exist")
 
     settings = get_settings()
     configure_logging(settings.log_level)
     try:
+        if args.check_db:
+            return _check_database(settings)
         return asyncio.run(_run_meta_only(settings))
-    except ProviderError as exc:
-        logger.error("Meta-only scan failed: %s", exc)
+    except (
+        ProviderError,
+        DatabaseConfigurationError,
+        DatabasePersistenceError,
+    ) as exc:
+        logger.error("Command failed: %s", exc)
         return 1
 
 

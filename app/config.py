@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     provider_retry_min_wait_seconds: float = Field(default=1.0, ge=0)
     provider_retry_max_wait_seconds: float = Field(default=10.0, ge=0)
 
+    database_url: str | None = None
+    persist_scan_results: bool = False
+    database_connect_timeout_seconds: int = Field(default=10, ge=1, le=60)
+
     meta_access_token: str | None = None
     meta_ad_provider: str | None = None
     meta_api_version: str = Field(default="v26.0", pattern=r"^v\d+\.\d+$")

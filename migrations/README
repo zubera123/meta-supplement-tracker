@@ -1,0 +1,3 @@
+This directory contains the Alembic migration environment for the tracker database.
+
+Set DATABASE_URL and run `alembic upgrade head` before enabling scan persistence.
