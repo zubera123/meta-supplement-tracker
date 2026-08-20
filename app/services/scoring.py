@@ -5,6 +5,21 @@ from dataclasses import dataclass
 from app.models import BrandCandidate
 
 
+def instagram_follower_filter(
+    followers: int | None,
+    *,
+    minimum: int = 10_000,
+    maximum: int = 100_000,
+) -> bool | None:
+    """Return inclusive filter status, preserving unknown as ``None``."""
+
+    if minimum > maximum:
+        raise ValueError("Minimum followers cannot exceed maximum followers")
+    if followers is None:
+        return None
+    return minimum <= followers <= maximum
+
+
 @dataclass(frozen=True, slots=True)
 class ScoringCriteria:
     min_monthly_spend_usd: float = 5_000
@@ -38,11 +53,11 @@ class CandidateScorer:
             <= spend
             <= self.criteria.max_monthly_spend_usd
         )
-        followers_qualify = followers is not None and (
-            self.criteria.min_instagram_followers
-            <= followers
-            <= self.criteria.max_instagram_followers
-        )
+        followers_qualify = instagram_follower_filter(
+            followers,
+            minimum=self.criteria.min_instagram_followers,
+            maximum=self.criteria.max_instagram_followers,
+        ) is True
 
         if spend is None:
             reasons.append("Monthly Meta ad spend estimate is unavailable")

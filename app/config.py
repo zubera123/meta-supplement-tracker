@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     apify_actor_id: str = "solidcode/meta-ads-library-scraper"
     apify_max_results_per_query: int = Field(default=500, ge=1, le=50_000)
     apify_max_total_charge_usd_per_run: float = Field(default=0.02, gt=0)
+    apify_include_advertiser_details: bool = True
     apify_monthly_budget_gbp: float = Field(default=30.0, gt=0)
     apify_budget_gbp_per_usd: float = Field(default=1.0, gt=0)
     apify_request_timeout_seconds: float = Field(default=120.0, gt=0, le=3600)

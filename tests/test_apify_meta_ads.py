@@ -3,12 +3,14 @@
 import asyncio
 import json
 import logging
+from decimal import Decimal
 
 import httpx
 import pytest
 from pydantic import ValidationError
 
 from app.config import Settings
+from app.jobs.brand_scan import _build_meta_only_output
 from app.models import Region
 from app.services import ProviderConfigurationError, ProviderError
 from app.services.meta_ads import (
@@ -16,6 +18,7 @@ from app.services.meta_ads import (
     APIFY_UNAVAILABLE_EU_COUNTRY_CODES,
     ApifyMetaAdsProvider,
 )
+from app.services.scoring import instagram_follower_filter
 
 
 def apify_ad(
@@ -23,12 +26,20 @@ def apify_ad(
     *,
     page_id: str = "page-1",
     page_name: str = "Example Supplements",
+    instagram_user: object = "example_supplements",
+    instagram_followers: object = 25_000,
 ) -> dict[str, object]:
     return {
         "adArchiveID": ad_id,
         "adLibraryURL": f"https://www.facebook.com/ads/library/?id={ad_id}",
         "pageID": page_id,
         "pageName": page_name,
+        "pageCategory": "Vitamin Supplement Shop",
+        "pageLikes": 12_000,
+        "pageVerified": True,
+        "pageInstagramUser": instagram_user,
+        "pageInstagramFollowers": instagram_followers,
+        "pageAboutText": "Example brand",
         "adStatus": "ACTIVE",
         "publisherPlatforms": ["FACEBOOK", "INSTAGRAM"],
         "startDate": "2026-07-01",
@@ -58,6 +69,7 @@ def run_provider(
     regions: list[str] | None = None,
     max_results: int = 500,
     max_charge_usd: float = 0.02,
+    include_advertiser_details: bool = True,
     monthly_budget_gbp: float = 30,
     timeout: float = 120,
 ) -> list:
@@ -68,6 +80,7 @@ def run_provider(
                 client=client,
                 max_results_per_query=max_results,
                 max_total_charge_usd_per_run=max_charge_usd,
+                include_advertiser_details=include_advertiser_details,
                 monthly_budget_gbp=monthly_budget_gbp,
                 request_timeout_seconds=timeout,
                 retry_attempts=2,
@@ -128,7 +141,7 @@ def test_successful_actor_run_uses_documented_contract_and_normalizes() -> None:
                 "adActiveStatus": "ACTIVE",
                 "adType": "ALL",
                 "scrapeAdDetails": True,
-                "includeAboutPage": False,
+                "includeAboutPage": True,
                 "onlyTotalCount": False,
                 "maxResults": 500,
             }
@@ -160,6 +173,11 @@ def test_successful_actor_run_uses_documented_contract_and_normalizes() -> None:
     assert record.ads[0].ad_id == "ad-1"
     assert record.ads[0].landing_page_url == "https://example.test/magnesium"
     assert record.ads[0].matched_countries == ["GB"]
+    assert record.brand.instagram_handle == "example_supplements"
+    assert record.social_stats is not None
+    assert record.social_stats.instagram_handle == "example_supplements"
+    assert record.social_stats.instagram_followers == 25_000
+    assert record.social_stats.instagram_profile_url is None
     assert all(request.headers["authorization"] == "Bearer test-token" for request in requests)
     assert all("token" not in request.url.params for request in requests)
 
@@ -234,6 +252,108 @@ def test_actor_request_uses_configured_per_run_ceiling() -> None:
     run_provider(httpx.MockTransport(handler), max_charge_usd=0.07)
 
     assert requested_ceiling == "0.07"
+
+
+def test_missing_instagram_data_remains_unknown() -> None:
+    records = run_provider(
+        standard_handler(
+            [apify_ad(instagram_user=None, instagram_followers=None)]
+        )
+    )
+
+    assert records[0].brand.instagram_handle is None
+    assert records[0].social_stats is not None
+    assert records[0].social_stats.instagram_handle is None
+    assert records[0].social_stats.instagram_followers is None
+
+
+def test_advertiser_enrichment_can_be_disabled() -> None:
+    actor_input: dict[str, object] | None = None
+    fallback = standard_handler([apify_ad()])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal actor_input
+        if request.url.path.endswith("/runs"):
+            actor_input = json.loads(request.content)
+        return fallback.handle_request(request)
+
+    records = run_provider(
+        httpx.MockTransport(handler), include_advertiser_details=False
+    )
+
+    assert actor_input is not None
+    assert actor_input["includeAboutPage"] is False
+    assert records[0].social_stats is None
+
+
+def test_documented_integer_follower_count_is_normalized() -> None:
+    records = run_provider(
+        standard_handler([apify_ad(instagram_followers=42_345)])
+    )
+
+    assert records[0].social_stats is not None
+    assert records[0].social_stats.instagram_followers == 42_345
+
+
+def test_malformed_follower_count_is_unknown_not_guessed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING)
+    records = run_provider(
+        standard_handler([apify_ad(instagram_followers="42,345")])
+    )
+
+    assert records[0].social_stats is not None
+    assert records[0].social_stats.instagram_followers is None
+    assert "expected a non-negative integer" in caplog.text
+
+
+@pytest.mark.parametrize("followers", [10_000, 100_000])
+def test_instagram_follower_filter_includes_boundaries(followers: int) -> None:
+    assert instagram_follower_filter(followers) is True
+
+
+@pytest.mark.parametrize("followers", [9_999, 100_001])
+def test_instagram_follower_filter_rejects_out_of_range(followers: int) -> None:
+    assert instagram_follower_filter(followers) is False
+
+
+def test_instagram_follower_filter_preserves_unknown() -> None:
+    assert instagram_follower_filter(None) is None
+
+
+def test_advertiser_enrichment_updates_documented_cost_projection() -> None:
+    enriched = ApifyMetaAdsProvider(
+        api_token="test-token",
+        max_results_per_query=1_000,
+        max_total_charge_usd_per_run=1,
+        include_advertiser_details=True,
+    )
+    unenriched = ApifyMetaAdsProvider(
+        api_token="test-token",
+        max_results_per_query=1_000,
+        max_total_charge_usd_per_run=1,
+        include_advertiser_details=False,
+    )
+
+    assert enriched.estimated_run_cost_usd == Decimal("0.905")
+    assert unenriched.estimated_run_cost_usd == Decimal("0.505")
+
+
+def test_meta_only_summary_shows_follower_filter_status() -> None:
+    records = run_provider(
+        standard_handler([apify_ad(instagram_followers=25_000)])
+    )
+
+    output = _build_meta_only_output(records, Settings(_env_file=None))
+
+    assert output["unique_advertisers"] == 1
+    assert output["unique_ads"] == 1
+    advertiser = output["advertisers"][0]
+    assert advertiser["instagram_username"] == "example_supplements"
+    assert advertiser["instagram_followers"] == 25_000
+    assert advertiser["passes_instagram_follower_filter"] is True
+    assert advertiser["instagram_follower_filter_status"] == "pass"
 
 
 def test_empty_results_return_no_advertisers() -> None:

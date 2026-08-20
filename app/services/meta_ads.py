@@ -13,7 +13,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from app.models import AdRecord, Brand, MetaAdDetails, Region
+from app.models import AdRecord, Brand, MetaAdDetails, Region, SocialStats
 from app.services import ProviderConfigurationError, ProviderError, TransientProviderError
 
 
@@ -114,6 +114,10 @@ APIFY_REGION_COUNTRIES: dict[str, tuple[Region, tuple[str, ...]]] = {
     "usa": (Region.USA, ("US",)),
     "canada": (Region.CANADA, ("CA",)),
 }
+APIFY_ACTOR_START_USD = Decimal("0.005")
+APIFY_AD_RESULT_USD = Decimal("0.0004")
+APIFY_CREATIVE_DETAILS_USD = Decimal("0.0001")
+APIFY_ADVERTISER_DETAILS_USD = Decimal("0.0004")
 _APIFY_TERMINAL_STATUSES = {
     "SUCCEEDED",
     "FAILED",
@@ -151,6 +155,7 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
         actor_id: str = "solidcode/meta-ads-library-scraper",
         max_results_per_query: int = 500,
         max_total_charge_usd_per_run: float = 0.02,
+        include_advertiser_details: bool = True,
         monthly_budget_gbp: float = 30.0,
         budget_gbp_per_usd: float = 1.0,
         request_timeout_seconds: float = 120.0,
@@ -192,6 +197,7 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
         self._actor_ref = quote(actor_ref, safe="~")
         self._max_results = max_results_per_query
         self._max_total_charge_usd_per_run = max_charge_usd
+        self._include_advertiser_details = include_advertiser_details
         self._monthly_budget_gbp = monthly_budget
         self._gbp_per_usd = gbp_per_usd
         self._request_timeout_seconds = request_timeout_seconds
@@ -220,6 +226,18 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
         planned_cost_usd = (
             self._max_total_charge_usd_per_run * len(country_queries)
         )
+        estimated_run_cost_usd = self.estimated_run_cost_usd
+        if self._max_total_charge_usd_per_run < estimated_run_cost_usd:
+            logger.warning(
+                "Apify per-run charge ceiling is below the documented maximum "
+                "cost for the configured result limit; the Actor may stop early",
+                extra={
+                    "charge_ceiling_usd": float(
+                        self._max_total_charge_usd_per_run
+                    ),
+                    "estimated_run_cost_usd": float(estimated_run_cost_usd),
+                },
+            )
 
         if self._client is not None:
             ads = await self._retrieve_with_client(
@@ -249,8 +267,20 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
                 "max_total_charge_usd_per_run": float(
                     self._max_total_charge_usd_per_run
                 ),
+                "advertiser_details_included": self._include_advertiser_details,
+                "estimated_run_cost_usd": float(estimated_run_cost_usd),
             },
+            include_advertiser_details=self._include_advertiser_details,
         )
+
+    @property
+    def estimated_run_cost_usd(self) -> Decimal:
+        """Maximum documented event cost for one fully populated Actor run."""
+
+        per_result = APIFY_AD_RESULT_USD + APIFY_CREATIVE_DETAILS_USD
+        if self._include_advertiser_details:
+            per_result += APIFY_ADVERTISER_DETAILS_USD
+        return APIFY_ACTOR_START_USD + Decimal(self._max_results) * per_result
 
     @staticmethod
     def _normalize_keywords(categories: Sequence[str]) -> list[str]:
@@ -369,7 +399,7 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
             "adActiveStatus": "ACTIVE",
             "adType": "ALL",
             "scrapeAdDetails": True,
-            "includeAboutPage": False,
+            "includeAboutPage": self._include_advertiser_details,
             "onlyTotalCount": False,
             "maxResults": self._max_results,
         }
@@ -581,6 +611,20 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
                 raw_ad.get("pageProfilePictureURL")
             ),
             advertiser_country=_string_or_none(raw_ad.get("pageCountry")),
+            facebook_page_category=_string_or_none(raw_ad.get("pageCategory")),
+            facebook_page_likes=_documented_nonnegative_int(
+                raw_ad.get("pageLikes"), field_name="pageLikes", ad_id=ad_id
+            ),
+            facebook_page_verified=_documented_bool(
+                raw_ad.get("pageVerified"), field_name="pageVerified", ad_id=ad_id
+            ),
+            facebook_page_about=_string_or_none(raw_ad.get("pageAboutText")),
+            instagram_handle=_string_or_none(raw_ad.get("pageInstagramUser")),
+            instagram_followers=_documented_nonnegative_int(
+                raw_ad.get("pageInstagramFollowers"),
+                field_name="pageInstagramFollowers",
+                ad_id=ad_id,
+            ),
             creative_bodies=creative_bodies,
             platforms=_string_list(raw_ad.get("publisherPlatforms")),
             declared_spend=_string_or_none(raw_ad.get("spend")),
@@ -936,6 +980,38 @@ def _string_or_none(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _documented_nonnegative_int(
+    value: object, *, field_name: str, ad_id: str
+) -> int | None:
+    """Accept the Actor's documented integer type; malformed data stays unknown."""
+
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    logger.warning(
+        "Ignoring malformed Apify %s value for ad %s; expected a non-negative integer",
+        field_name,
+        ad_id,
+    )
+    return None
+
+
+def _documented_bool(
+    value: object, *, field_name: str, ad_id: str
+) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    logger.warning(
+        "Ignoring malformed Apify %s value for ad %s; expected a boolean",
+        field_name,
+        ad_id,
+    )
+    return None
+
+
 def _response_json_object(
     response: httpx.Response, operation: str
 ) -> dict[str, object]:
@@ -964,6 +1040,7 @@ def _aggregate_advertisers(
     *,
     provider: str,
     provider_metadata: dict[str, str | int | float | bool | None],
+    include_advertiser_details: bool,
 ) -> list[AdRecord]:
     grouped: dict[str, list[MetaAdDetails]] = defaultdict(list)
     for ad in ads_by_id.values():
@@ -991,9 +1068,20 @@ def _aggregate_advertisers(
             for ad in active_ads
             if ad.ad_delivery_start_time is not None
         ]
+        social_stats = (
+            _aggregate_social_stats(page_id, page_ads)
+            if include_advertiser_details
+            else None
+        )
         records.append(
             AdRecord(
-                brand=Brand(name=page_ads[0].page_name, source_id=page_id),
+                brand=Brand(
+                    name=page_ads[0].page_name,
+                    instagram_handle=(
+                        social_stats.instagram_handle if social_stats else None
+                    ),
+                    source_id=page_id,
+                ),
                 region=regions[0],
                 regions=regions,
                 estimated_monthly_spend_usd=None,
@@ -1001,10 +1089,46 @@ def _aggregate_advertisers(
                 oldest_active_ad=min(start_times) if start_times else None,
                 newest_active_ad=max(start_times) if start_times else None,
                 ads=page_ads,
+                social_stats=social_stats,
                 provider_metadata={"provider": provider, **provider_metadata},
             )
         )
     return sorted(records, key=lambda record: record.brand.name.casefold())
+
+
+def _aggregate_social_stats(
+    page_id: str, page_ads: Sequence[MetaAdDetails]
+) -> SocialStats:
+    handles = list(
+        dict.fromkeys(ad.instagram_handle for ad in page_ads if ad.instagram_handle)
+    )
+    follower_counts = list(
+        dict.fromkeys(
+            ad.instagram_followers
+            for ad in page_ads
+            if ad.instagram_followers is not None
+        )
+    )
+    if len(handles) > 1:
+        logger.warning(
+            "Conflicting Instagram usernames returned for advertiser page %s; "
+            "keeping username unknown",
+            page_id,
+        )
+    if len(follower_counts) > 1:
+        logger.warning(
+            "Conflicting Instagram follower counts returned for advertiser page %s; "
+            "keeping follower count unknown",
+            page_id,
+        )
+    return SocialStats(
+        instagram_handle=handles[0] if len(handles) == 1 else None,
+        instagram_followers=(
+            follower_counts[0] if len(follower_counts) == 1 else None
+        ),
+        # The Actor currently documents no Instagram profile URL output field.
+        instagram_profile_url=None,
+    )
 
 
 def _sanitize_snapshot_url(value: object) -> str | None:
@@ -1050,6 +1174,12 @@ def _merge_duplicate_ad(existing: MetaAdDetails, duplicate: MetaAdDetails) -> Me
         "advertiser_page_url",
         "page_profile_picture_url",
         "advertiser_country",
+        "facebook_page_category",
+        "facebook_page_likes",
+        "facebook_page_verified",
+        "facebook_page_about",
+        "instagram_handle",
+        "instagram_followers",
         "creative_bodies",
         "creative_link_captions",
         "creative_link_descriptions",

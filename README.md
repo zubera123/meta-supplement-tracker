@@ -2,7 +2,7 @@
 
 Initial production-oriented foundation for discovering supplement brands advertising on Meta. Apify's `solidcode/meta-ads-library-scraper` Actor is the primary commercial discovery provider. Meta's official Ad Library API provider remains available as an alternative for its documented UK/EU coverage.
 
-No external-data integration is simulated. Instagram, reviews, and Google Docs remain explicit provider contracts until verified providers are selected and implemented.
+No external-data integration is simulated. The Apify Actor supplies linked Instagram metadata where Meta exposes it; a separate Instagram provider, reviews, and Google Docs remain explicit contracts until verified sources are selected and implemented.
 
 ## Current capabilities
 
@@ -10,6 +10,7 @@ No external-data integration is simulated. Instagram, reviews, and Google Docs r
 - Environment-based settings with no embedded credentials
 - Typed domain models for brands, ads, social data, reviews, and candidates
 - Apify Actor discovery for active commercial ads in the UK, supported EU countries, USA, and Canada
+- Optional advertiser-page enrichment with linked Instagram username and follower count
 - Official Meta Ad Library API discovery retained as a UK/EU alternative
 - Cursor pagination, bounded transient retries, ad deduplication, and advertiser aggregation
 - Inclusive qualification filters for estimated monthly spend of $5,000–$30,000 and Instagram audiences of 10,000–100,000
@@ -82,6 +83,7 @@ Settings are loaded from environment variables and, for local development, `.env
 | `APIFY_ACTOR_ID` | `solidcode/meta-ads-library-scraper` |
 | `APIFY_MAX_RESULTS_PER_QUERY` | `500`; maximum results for each country Actor run, shared across all search terms |
 | `APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN` | `0.02`; server-side ceiling for each Actor run |
+| `APIFY_INCLUDE_ADVERTISER_DETAILS` | `true`; enables documented page and linked Instagram enrichment |
 | `APIFY_MONTHLY_BUDGET_GBP` | `30`; aborts before starting paid runs when projected monthly usage exceeds this guard |
 | `APIFY_BUDGET_GBP_PER_USD` | `1.0`; conservative conversion applied to Apify's USD usage figures |
 | `APIFY_REQUEST_TIMEOUT_SECONDS` | `120`; overall wait limit for each Actor run |
@@ -104,6 +106,7 @@ APIFY_API_TOKEN=<secret Apify API token>
 APIFY_ACTOR_ID=solidcode/meta-ads-library-scraper
 APIFY_MAX_RESULTS_PER_QUERY=500
 APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN=0.02
+APIFY_INCLUDE_ADVERTISER_DETAILS=true
 APIFY_MONTHLY_BUDGET_GBP=30
 APIFY_BUDGET_GBP_PER_USD=1.0
 APIFY_REQUEST_TIMEOUT_SECONDS=120
@@ -111,9 +114,11 @@ APIFY_REQUEST_TIMEOUT_SECONDS=120
 
 The implementation follows the Actor's current [input/output reference and pricing](https://apify.com/solidcode/meta-ads-library-scraper) and [generated OpenAPI definition](https://apify.com/solidcode/meta-ads-library-scraper/api/openapi). It starts runs asynchronously through Apify's documented [Run Actor endpoint](https://docs.apify.com/api/v2/actors-runs-post), polls the [Get run endpoint](https://docs.apify.com/api/v2/actor-run-get), and pages through the [default dataset items endpoint](https://docs.apify.com/api/v2/actor-run-dataset-items-get). Tokens are sent in the recommended `Authorization: Bearer` header, never in URLs or logs.
 
-Each country run sends only documented Actor input fields: `searchTerms`, `country`, `adActiveStatus="ACTIVE"`, `adType="ALL"`, `scrapeAdDetails=true`, `includeAboutPage=false`, `onlyTotalCount=false`, and `maxResults`. Creative-detail enrichment is enabled because it is the documented source of CTA landing URLs and snapshot URLs. Advertiser-page enrichment is deliberately disabled; Instagram data is outside this stage.
+Each country run sends only documented Actor input fields: `searchTerms`, `country`, `adActiveStatus="ACTIVE"`, `adType="ALL"`, `scrapeAdDetails=true`, `includeAboutPage`, `onlyTotalCount=false`, and `maxResults`. Creative-detail enrichment is enabled because it is the documented source of CTA landing URLs and snapshot URLs. `includeAboutPage` follows `APIFY_INCLUDE_ADVERTISER_DETAILS`; when enabled, the Actor documents page category, likes, verification, About text, linked Instagram username, and Instagram follower count.
 
-The provider retains documented ad IDs, page IDs and names, status, platforms, dates, body copy, Ad Library and snapshot URLs, genuine CTA landing URLs, and real audience fields if present. Commercial spend is not estimated or inferred, so `estimated_monthly_spend_usd` remains `null`. The Actor documents spend, impressions, and several audience disclosures as political/issue-ad-only; if such a real declared range is returned it is preserved separately as `declared_spend`, but ordinary supplement searches must not be assumed to contain it.
+The provider retains documented ad IDs, page IDs and names, status, platforms, dates, body copy, Ad Library and snapshot URLs, genuine CTA landing URLs, advertiser details, and real audience fields if present. Linked Instagram username and integer follower count are normalized into `SocialStats` and the brand handle. Missing, malformed, or conflicting values remain unknown. The Actor does not currently document an Instagram profile-URL output field, so the project does not construct or guess one. Commercial spend is not estimated or inferred, so `estimated_monthly_spend_usd` remains `null`. The Actor documents spend, impressions, and several audience disclosures as political/issue-ad-only; if such a real declared range is returned it is preserved separately as `declared_spend`, but ordinary supplement searches must not be assumed to contain it.
+
+The Instagram follower filter is inclusive: 10,000 and 100,000 both pass; values below or above fail; unknown remains unknown. Meta-only discovery reports the filter status but does not discard records, making missing enrichment visible. The future full pipeline can use the same filter when qualifying candidates.
 
 ### Region handling
 
@@ -130,11 +135,11 @@ The current Actor schema does not list `BG, HR, CY, EE, LV, LT, LU, MT, SK, SI`.
 
 ### Cost controls and retries
 
-Current Actor pricing is $0.40 per 1,000 ad rows plus $0.10 per 1,000 rows for the enabled creative details: $0.50 per 1,000 results total. At that configuration, the maximum result charges are $0.50 for 1,000, $5.00 for 10,000, and $25.00 for 50,000 results. Apify bills in USD; these figures exclude any taxes or external currency-conversion effects.
+The Actor's current public pricing metadata lists a $0.005 Actor-start event, $0.40 per 1,000 ad rows, $0.10 per 1,000 rows for creative details, and $0.40 per 1,000 rows for advertiser details. With both enrichments enabled, 1,000 results cost $0.90 in row events plus $0.005 to start the run, or $0.905 per country run. Without advertiser enrichment, the corresponding amount is $0.505. Apify bills in USD; these figures exclude taxes or external currency-conversion effects.
 
 Before any paid run starts, the provider reads `current.monthlyUsageUsd` from Apify's documented [account limits endpoint](https://docs.apify.com/api/v2/users-me-limits-get). It reserves `APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN` for every planned country run, converts the projected account usage using `APIFY_BUDGET_GBP_PER_USD`, and aborts if the total exceeds `APIFY_MONTHLY_BUDGET_GBP`. The default `1.0` deliberately treats each reported USD as £1, which is conservative relative to a lower GBP-per-USD rate; update the setting only if you intentionally want another budgeting rate. Every run receives the configured ceiling through Apify's documented `maxTotalChargeUsd` server-side parameter.
 
-The per-run ceiling defaults to a conservative `$0.02` and is independent of the result-count limit. A low ceiling can intentionally stop a large requested result set before all rows are collected. Non-positive ceilings and a single-run ceiling above the converted monthly budget are rejected during configuration; the full multi-country conflict is checked against live monthly usage immediately before any paid run starts. `APIFY_MAX_RESULTS_PER_QUERY` is always positive, so unlimited Actor runs are not exposed. Read-only API calls retry bounded transient network, HTTP 429, and server failures. A paid Actor start is not automatically retried after a network error because an ambiguous retry could create a second billable run. Runs exceeding the configured timeout are aborted. The monthly pre-check is deliberately account-wide and fail-closed, but it cannot make independent concurrent processes atomic; use Apify's account spending controls as an additional account-level backstop.
+The provider calculates the documented event-cost estimate using the configured result limit and enrichment flag. The per-run ceiling defaults to a conservative `$0.02` and is independent of the result-count limit. A ceiling below the calculated estimate is logged and can intentionally stop a large requested result set before all rows are collected. Non-positive ceilings and a single-run ceiling above the converted monthly budget are rejected during configuration; the full multi-country conflict reserves the entire configured ceiling for every planned run and checks it against live monthly usage before any paid run starts. `APIFY_MAX_RESULTS_PER_QUERY` is always positive, so unlimited Actor runs are not exposed. Read-only API calls retry bounded transient network, HTTP 429, and server failures. A paid Actor start is not automatically retried after a network error because an ambiguous retry could create a second billable run. Runs exceeding the configured timeout are aborted. The monthly pre-check is deliberately account-wide and fail-closed, but it cannot make independent concurrent processes atomic; use Apify's account spending controls as an additional account-level backstop.
 
 ### Manual and Railway live test
 
@@ -147,31 +152,31 @@ python -m app.jobs.brand_scan --meta-only
 If the token exists only in Railway, do not copy it locally. After deploying this code, install and authenticate the current Railway CLI, link it to the project/service, then execute a capped test inside the running container:
 
 ```bash
-railway ssh -- env SCAN_REGIONS=UK APIFY_MAX_RESULTS_PER_QUERY=20 APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN=0.02 python -m app.jobs.brand_scan --meta-only
+railway ssh -- env SCAN_REGIONS=UK APIFY_MAX_RESULTS_PER_QUERY=20 APIFY_INCLUDE_ADVERTISER_DETAILS=true APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN=0.03 python -m app.jobs.brand_scan --meta-only
 ```
 
-Railway's current [`railway ssh` documentation](https://docs.railway.com/cli/ssh) supports running a command in the deployed service. This override performs one UK country run with at most 20 enriched results, an intended result charge of approximately $0.01, and a hard total run ceiling of $0.02. It does not expose the token. Inspect the JSON output and Railway logs. The command invokes only Meta discovery; it does not run social/review enrichment, Google Docs, scoring output, or scheduling.
+Railway's current [`railway ssh` documentation](https://docs.railway.com/cli/ssh) supports running a command in the deployed service. This override performs one UK country run with at most 20 fully enriched rows. Current documented event pricing projects $0.023: $0.005 to start plus 20 × $0.0009, protected by a hard $0.03 ceiling. It does not expose the token. The command invokes only Meta discovery; it does not run a separate Instagram scraper, reviews, Google Docs, or scheduling.
 
 A sanitised output shape is:
 
 ```json
-[
-  {
-    "brand": {"name": "<page name>", "source_id": "<page id>"},
-    "regions": ["UK"],
-    "estimated_monthly_spend_usd": null,
-    "active_ad_count": 1,
-    "ads": [
-      {
-        "ad_id": "<Meta archive ID>",
-        "ad_status": "ACTIVE",
-        "ad_library_url": "<public Ad Library URL>",
-        "landing_page_url": "<CTA URL when returned>",
-        "matched_countries": ["GB"]
-      }
-    ]
-  }
-]
+{
+  "unique_advertisers": 1,
+  "unique_ads": 2,
+  "follower_filter": {"minimum": 10000, "maximum": 100000},
+  "advertisers": [
+    {
+      "facebook_page_name": "<page name>",
+      "facebook_page_id": "<page id>",
+      "active_ad_count": 2,
+      "instagram_username": "<username or null>",
+      "instagram_profile_url": null,
+      "instagram_followers": 25000,
+      "passes_instagram_follower_filter": true,
+      "instagram_follower_filter_status": "pass"
+    }
+  ]
+}
 ```
 
 ## Meta Ad Library API
@@ -248,30 +253,8 @@ After configuring the authorised token, run:
 python -m app.jobs.brand_scan --meta-only
 ```
 
-This performs only Meta discovery. It does not invoke Instagram, reviews, Google Docs, scoring output, scheduling, or fake data. Results are emitted as JSON. A shape-only, sanitised example is:
+This performs only Meta discovery. The official provider has no linked Instagram enrichment, so its follower status is unknown. It does not invoke a separate Instagram provider, reviews, Google Docs, scheduling, or fake data. Results use the same advertiser-summary JSON shape documented above.
 
-```json
-[
-  {
-    "brand": {"name": "<page name>", "source_id": "<page id>"},
-    "regions": ["UK"],
-    "estimated_monthly_spend_usd": null,
-    "active_ad_count": 2,
-    "oldest_active_ad": "<UTC timestamp>",
-    "newest_active_ad": "<UTC timestamp>",
-    "ads": [
-      {
-        "ad_id": "<Meta Library ID>",
-        "page_id": "<page id>",
-        "page_name": "<page name>",
-        "creative_bodies": ["<ad text>"],
-        "platforms": ["facebook", "instagram"],
-        "matched_regions": ["UK"]
-      }
-    ]
-  }
-]
-```
 
 ## Tests
 
@@ -309,7 +292,7 @@ No Railway deployment is performed by this project setup.
 
 - Defensible commercial Meta spend estimation; the official Ad Library API does not return commercial spend
 - EU countries absent from the current SolidCode Actor country schema
-- Instagram follower enrichment
+- Instagram profile URL, because the current Actor does not document one
 - Trustpilot or other reviews enrichment
 - Google Docs authentication and writes
 - Scheduled invocation of the scan job

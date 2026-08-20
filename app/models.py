@@ -43,6 +43,12 @@ class MetaAdDetails(BaseModel):
     advertiser_page_url: str | None = None
     page_profile_picture_url: str | None = None
     advertiser_country: str | None = None
+    facebook_page_category: str | None = None
+    facebook_page_likes: int | None = Field(default=None, ge=0)
+    facebook_page_verified: bool | None = None
+    facebook_page_about: str | None = None
+    instagram_handle: str | None = None
+    instagram_followers: int | None = Field(default=None, ge=0)
     creative_bodies: list[str] = Field(default_factory=list)
     creative_link_captions: list[str] = Field(default_factory=list)
     creative_link_descriptions: list[str] = Field(default_factory=list)
@@ -69,6 +75,15 @@ class MetaAdDetails(BaseModel):
     matched_regions: list[Region] = Field(default_factory=list)
 
 
+class SocialStats(BaseModel):
+    """Normalized social audience data."""
+
+    instagram_followers: int | None = Field(default=None, ge=0)
+    instagram_handle: str | None = None
+    instagram_profile_url: HttpUrl | None = None
+    observed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
 class AdRecord(BaseModel):
     """Provider-normalized, advertiser-level advertising data."""
 
@@ -80,19 +95,11 @@ class AdRecord(BaseModel):
     oldest_active_ad: datetime | None = None
     newest_active_ad: datetime | None = None
     ads: list[MetaAdDetails] = Field(default_factory=list)
+    social_stats: SocialStats | None = None
     observed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     provider_metadata: dict[str, str | int | float | bool | None] = Field(
         default_factory=dict
     )
-
-
-class SocialStats(BaseModel):
-    """Normalized social audience data."""
-
-    instagram_followers: int | None = Field(default=None, ge=0)
-    instagram_handle: str | None = None
-    observed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-
 
 class ReviewStats(BaseModel):
     """Normalized review data from an optional reviews provider."""

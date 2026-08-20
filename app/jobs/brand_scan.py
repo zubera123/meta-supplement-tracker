@@ -11,7 +11,7 @@ from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt,
 
 from app.config import Settings, get_settings
 from app.logging_config import configure_logging
-from app.models import Brand, BrandCandidate, ReviewStats, SocialStats
+from app.models import AdRecord, Brand, BrandCandidate, ReviewStats, SocialStats
 from app.services import ProviderError, TransientProviderError
 from app.services.google_docs import BrandOutputProvider
 from app.services.instagram import InstagramProvider
@@ -22,6 +22,7 @@ from app.services.meta_ads import (
 )
 from app.services.reviews import ReviewsProvider
 from app.services.scoring import CandidateScorer
+from app.services.scoring import instagram_follower_filter
 
 
 logger = logging.getLogger(__name__)
@@ -91,7 +92,9 @@ class BrandScanJob:
 
         for ad_record in ad_records:
             brand = ad_record.brand
-            social_stats = await self._enrich_social(brand)
+            social_stats = ad_record.social_stats
+            if social_stats is None:
+                social_stats = await self._enrich_social(brand)
             review_stats = await self._enrich_reviews(brand)
             evaluated = self.scorer.evaluate(
                 BrandCandidate(
@@ -122,6 +125,9 @@ async def _run_meta_only(settings: Settings) -> int:
             max_total_charge_usd_per_run=(
                 settings.apify_max_total_charge_usd_per_run
             ),
+            include_advertiser_details=(
+                settings.apify_include_advertiser_details
+            ),
             monthly_budget_gbp=settings.apify_monthly_budget_gbp,
             budget_gbp_per_usd=settings.apify_budget_gbp_per_usd,
             request_timeout_seconds=settings.apify_request_timeout_seconds,
@@ -147,8 +153,53 @@ async def _run_meta_only(settings: Settings) -> int:
         regions=settings.regions,
         categories=settings.categories,
     )
-    print(json.dumps([record.model_dump(mode="json") for record in records], indent=2))
+    print(json.dumps(_build_meta_only_output(records, settings), indent=2))
     return 0
+
+
+def _build_meta_only_output(
+    records: Sequence[AdRecord], settings: Settings
+) -> dict[str, object]:
+    advertisers: list[dict[str, object]] = []
+    for record in records:
+        social = record.social_stats
+        followers = social.instagram_followers if social else None
+        filter_result = instagram_follower_filter(
+            followers,
+            minimum=settings.target_min_instagram_followers,
+            maximum=settings.target_max_instagram_followers,
+        )
+        advertisers.append(
+            {
+                "facebook_page_name": record.brand.name,
+                "facebook_page_id": record.brand.source_id,
+                "active_ad_count": record.active_ad_count,
+                "instagram_username": (
+                    social.instagram_handle if social else None
+                ),
+                "instagram_profile_url": (
+                    str(social.instagram_profile_url)
+                    if social and social.instagram_profile_url
+                    else None
+                ),
+                "instagram_followers": followers,
+                "passes_instagram_follower_filter": filter_result,
+                "instagram_follower_filter_status": (
+                    "unknown"
+                    if filter_result is None
+                    else "pass" if filter_result else "fail"
+                ),
+            }
+        )
+    return {
+        "unique_advertisers": len(advertisers),
+        "unique_ads": sum(len(record.ads) for record in records),
+        "follower_filter": {
+            "minimum": settings.target_min_instagram_followers,
+            "maximum": settings.target_max_instagram_followers,
+        },
+        "advertisers": advertisers,
+    }
 
 
 def main() -> int:
