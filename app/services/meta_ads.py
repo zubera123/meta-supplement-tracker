@@ -1,10 +1,13 @@
-"""Meta Ad Library provider using Meta's documented Graph API."""
+"""Meta advertising providers backed by documented HTTP contracts."""
 
 import json
 import logging
+import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
+from decimal import Decimal
+from urllib.parse import quote
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -91,6 +94,38 @@ META_AD_FIELDS: tuple[str, ...] = (
 
 _THROTTLE_GRAPH_ERROR_CODES = {4, 17, 32, 613}
 
+# The Actor's current country enum does not contain every EU member state.
+APIFY_EU_COUNTRY_CODES: tuple[str, ...] = tuple(
+    code
+    for code in EU_COUNTRY_CODES
+    if code
+    in {
+        "AT", "BE", "CZ", "DK", "FI", "FR", "DE", "GR", "HU", "IE",
+        "IT", "NL", "PL", "PT", "RO", "ES", "SE",
+    }
+)
+APIFY_UNAVAILABLE_EU_COUNTRY_CODES: tuple[str, ...] = tuple(
+    code for code in EU_COUNTRY_CODES if code not in APIFY_EU_COUNTRY_CODES
+)
+APIFY_REGION_COUNTRIES: dict[str, tuple[Region, tuple[str, ...]]] = {
+    "uk": (Region.UK, ("GB",)),
+    "europe": (Region.EUROPE, APIFY_EU_COUNTRY_CODES),
+    "eu": (Region.EUROPE, APIFY_EU_COUNTRY_CODES),
+    "usa": (Region.USA, ("US",)),
+    "canada": (Region.CANADA, ("CA",)),
+}
+APIFY_AD_RESULT_USD = Decimal("0.0004")
+APIFY_CREATIVE_DETAILS_USD = Decimal("0.0001")
+APIFY_RESULT_WITH_CREATIVE_USD = (
+    APIFY_AD_RESULT_USD + APIFY_CREATIVE_DETAILS_USD
+)
+_APIFY_TERMINAL_STATUSES = {
+    "SUCCEEDED",
+    "FAILED",
+    "TIMED-OUT",
+    "ABORTED",
+}
+
 
 class MetaAdsProvider(ABC):
     """Interface for a real, configured advertiser data source."""
@@ -107,6 +142,451 @@ class UnconfiguredMetaAdsProvider(MetaAdsProvider):
         self, *, regions: Sequence[str], categories: Sequence[str]
     ) -> list[AdRecord]:
         raise ProviderConfigurationError("No Meta ads provider has been configured")
+
+
+class ApifyMetaAdsProvider(MetaAdsProvider):
+    """Discover commercial ads with SolidCode's documented Apify Actor."""
+
+    _api_base = "https://api.apify.com/v2"
+
+    def __init__(
+        self,
+        *,
+        api_token: str | None,
+        actor_id: str = "solidcode/meta-ads-library-scraper",
+        max_results_per_query: int = 500,
+        monthly_budget_gbp: float = 30.0,
+        budget_gbp_per_usd: float = 1.0,
+        request_timeout_seconds: float = 120.0,
+        retry_attempts: int = 3,
+        retry_min_wait_seconds: float = 1.0,
+        retry_max_wait_seconds: float = 10.0,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        if not api_token:
+            raise ProviderConfigurationError(
+                "APIFY_API_TOKEN is required when META_AD_PROVIDER=apify"
+            )
+        if not actor_id.strip():
+            raise ProviderConfigurationError("APIFY_ACTOR_ID must not be empty")
+        if max_results_per_query < 1:
+            raise ProviderConfigurationError(
+                "APIFY_MAX_RESULTS_PER_QUERY must be at least 1"
+            )
+        if monthly_budget_gbp <= 0 or budget_gbp_per_usd <= 0:
+            raise ProviderConfigurationError(
+                "Apify budget and GBP-per-USD conversion must be positive"
+            )
+        self._api_token = api_token
+        self._headers = {"Authorization": f"Bearer {api_token}"}
+        self._actor_id = actor_id.strip()
+        actor_ref = self._actor_id.replace("/", "~")
+        self._actor_ref = quote(actor_ref, safe="~")
+        self._max_results = max_results_per_query
+        self._monthly_budget_gbp = Decimal(str(monthly_budget_gbp))
+        self._gbp_per_usd = Decimal(str(budget_gbp_per_usd))
+        self._request_timeout_seconds = request_timeout_seconds
+        self._retry_attempts = retry_attempts
+        self._retry_min_wait_seconds = retry_min_wait_seconds
+        self._retry_max_wait_seconds = retry_max_wait_seconds
+        self._client = client
+
+    async def retrieve_advertisers(
+        self, *, regions: Sequence[str], categories: Sequence[str]
+    ) -> list[AdRecord]:
+        resolved_regions = self._resolve_regions(regions)
+        keywords = self._normalize_keywords(categories)
+        if not resolved_regions:
+            logger.warning("No Apify Meta-ad regions are supported in this scan")
+            return []
+        if not keywords:
+            logger.warning("No Meta search keywords were configured")
+            return []
+
+        country_queries = [
+            (region, country)
+            for region, countries in resolved_regions
+            for country in countries
+        ]
+        maximum_run_cost_usd = (
+            Decimal(self._max_results) * APIFY_RESULT_WITH_CREATIVE_USD
+        )
+        planned_cost_usd = maximum_run_cost_usd * len(country_queries)
+
+        if self._client is not None:
+            ads = await self._retrieve_with_client(
+                self._client,
+                country_queries,
+                keywords,
+                planned_cost_usd,
+                maximum_run_cost_usd,
+            )
+        else:
+            async with httpx.AsyncClient(
+                timeout=self._request_timeout_seconds,
+                follow_redirects=False,
+                headers={"Authorization": f"Bearer {self._api_token}"},
+            ) as client:
+                ads = await self._retrieve_with_client(
+                    client,
+                    country_queries,
+                    keywords,
+                    planned_cost_usd,
+                    maximum_run_cost_usd,
+                )
+        return _aggregate_advertisers(
+            ads,
+            provider="apify",
+            provider_metadata={
+                "actor_id": self._actor_id,
+                "commercial_spend_available": False,
+            },
+        )
+
+    @staticmethod
+    def _normalize_keywords(categories: Sequence[str]) -> list[str]:
+        """Deduplicate terms without adding limits absent from the Actor schema."""
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for category in categories:
+            keyword = category.strip()
+            folded = keyword.casefold()
+            if keyword and folded not in seen:
+                normalized.append(keyword)
+                seen.add(folded)
+        return normalized
+
+    def _resolve_regions(
+        self, regions: Sequence[str]
+    ) -> list[tuple[Region, tuple[str, ...]]]:
+        resolved: list[tuple[Region, tuple[str, ...]]] = []
+        seen: set[Region] = set()
+        for requested in regions:
+            mapping = APIFY_REGION_COUNTRIES.get(requested.strip().casefold())
+            if mapping is None:
+                logger.warning(
+                    "Skipping unsupported Apify Meta-ad region %s: not present in the "
+                    "provider's configured region map",
+                    requested,
+                )
+                continue
+            if mapping[0] not in seen:
+                resolved.append(mapping)
+                seen.add(mapping[0])
+        if any(region is Region.EUROPE for region, _ in resolved):
+            logger.warning(
+                "Apify Actor country schema lacks these EU country codes; skipping them: %s",
+                ",".join(APIFY_UNAVAILABLE_EU_COUNTRY_CODES),
+            )
+        return resolved
+
+    async def _retrieve_with_client(
+        self,
+        client: httpx.AsyncClient,
+        country_queries: Sequence[tuple[Region, str]],
+        keywords: Sequence[str],
+        planned_cost_usd: Decimal,
+        maximum_run_cost_usd: Decimal,
+    ) -> dict[str, MetaAdDetails]:
+        current_usage_usd = await self._get_monthly_usage_usd(client)
+        projected_gbp = (current_usage_usd + planned_cost_usd) * self._gbp_per_usd
+        if projected_gbp > self._monthly_budget_gbp:
+            raise ProviderError(
+                "Apify monthly budget guard aborted the scan: current usage plus "
+                f"the planned maximum is GBP {projected_gbp:.2f}, exceeding "
+                f"APIFY_MONTHLY_BUDGET_GBP={self._monthly_budget_gbp:.2f}"
+            )
+        logger.info(
+            "Apify budget guard approved scan",
+            extra={
+                "current_usage_usd": float(current_usage_usd),
+                "planned_maximum_usd": float(planned_cost_usd),
+                "projected_usage_gbp": float(projected_gbp),
+            },
+        )
+
+        ads_by_id: dict[str, MetaAdDetails] = {}
+        for region, country in country_queries:
+            raw_items = await self._run_actor(
+                client,
+                country=country,
+                keywords=keywords,
+                maximum_run_cost_usd=maximum_run_cost_usd,
+            )
+            for index, item in enumerate(raw_items):
+                if not isinstance(item, dict):
+                    logger.warning(
+                        "Skipping malformed Apify dataset item",
+                        extra={"country": country, "item_index": index},
+                    )
+                    continue
+                try:
+                    ad = self._normalize_ad(item, region, country)
+                except (ProviderError, ValueError) as exc:
+                    logger.warning(
+                        "Skipping malformed Apify ad result: %s",
+                        exc,
+                        extra={"country": country, "item_index": index},
+                    )
+                    continue
+                existing = ads_by_id.get(ad.ad_id)
+                ads_by_id[ad.ad_id] = (
+                    ad if existing is None else _merge_duplicate_ad(existing, ad)
+                )
+        return ads_by_id
+
+    async def _get_monthly_usage_usd(self, client: httpx.AsyncClient) -> Decimal:
+        payload = await self._get_json_with_retry(client, f"{self._api_base}/users/me/limits")
+        data = payload.get("data")
+        current = data.get("current") if isinstance(data, dict) else None
+        value = current.get("monthlyUsageUsd") if isinstance(current, dict) else None
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            raise ProviderError(
+                "Apify limits response did not contain current.monthlyUsageUsd; "
+                "budget guard fails closed"
+            )
+        return Decimal(str(value))
+
+    async def _run_actor(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        country: str,
+        keywords: Sequence[str],
+        maximum_run_cost_usd: Decimal,
+    ) -> list[object]:
+        endpoint = f"{self._api_base}/acts/{self._actor_ref}/runs"
+        actor_input = {
+            "searchTerms": list(keywords),
+            "country": country,
+            "adActiveStatus": "ACTIVE",
+            "adType": "ALL",
+            "scrapeAdDetails": True,
+            "includeAboutPage": False,
+            "onlyTotalCount": False,
+            "maxResults": self._max_results,
+        }
+        params = {
+            "timeout": str(max(1, int(self._request_timeout_seconds))),
+            "maxTotalChargeUsd": format(maximum_run_cost_usd, "f"),
+        }
+        try:
+            response = await client.post(
+                endpoint, params=params, json=actor_input, headers=self._headers
+            )
+        except httpx.RequestError as exc:
+            # Starting a paid run is intentionally not retried: a lost response is
+            # ambiguous and retrying could create a second billable run.
+            raise ProviderError(
+                f"Apify Actor start request failed without a safe retry: {type(exc).__name__}"
+            ) from exc
+        payload = _response_json_object(response, "Apify Actor start")
+        if response.status_code >= 400:
+            raise ProviderError(_apify_http_error("Actor start", response, payload))
+        data = payload.get("data")
+        run_id = data.get("id") if isinstance(data, dict) else None
+        if not isinstance(run_id, str) or not run_id:
+            raise ProviderError("Apify Actor start response did not contain data.id")
+
+        run = await self._wait_for_run(client, run_id)
+        status = run.get("status")
+        if status != "SUCCEEDED":
+            message = run.get("statusMessage")
+            detail = f": {message}" if isinstance(message, str) and message else ""
+            raise ProviderError(f"Apify Actor run {run_id} ended with {status}{detail}")
+        dataset_id = run.get("defaultDatasetId")
+        if not isinstance(dataset_id, str) or not dataset_id:
+            raise ProviderError("Successful Apify Actor run has no defaultDatasetId")
+        return await self._get_dataset_items(client, dataset_id)
+
+    async def _wait_for_run(
+        self, client: httpx.AsyncClient, run_id: str
+    ) -> dict[str, object]:
+        deadline = time.monotonic() + self._request_timeout_seconds
+        endpoint = f"{self._api_base}/actor-runs/{quote(run_id, safe='')}"
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                await self._abort_timed_out_run(client, run_id)
+                raise ProviderError(
+                    f"Apify Actor run {run_id} exceeded "
+                    f"APIFY_REQUEST_TIMEOUT_SECONDS={self._request_timeout_seconds:g}"
+                )
+            payload = await self._get_json_with_retry(
+                client,
+                endpoint,
+                params={"waitForFinish": str(max(1, min(30, int(remaining))))},
+            )
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                raise ProviderError("Apify run response did not contain a data object")
+            status = data.get("status")
+            if status in _APIFY_TERMINAL_STATUSES:
+                return data
+            if not isinstance(status, str):
+                raise ProviderError("Apify run response did not contain a status")
+
+    async def _abort_timed_out_run(self, client: httpx.AsyncClient, run_id: str) -> None:
+        endpoint = f"{self._api_base}/actor-runs/{quote(run_id, safe='')}/abort"
+        try:
+            await client.post(endpoint, headers=self._headers)
+        except httpx.RequestError:
+            logger.exception("Failed to abort timed-out Apify Actor run %s", run_id)
+
+    async def _get_dataset_items(
+        self, client: httpx.AsyncClient, dataset_id: str
+    ) -> list[object]:
+        endpoint = f"{self._api_base}/datasets/{quote(dataset_id, safe='')}/items"
+        items: list[object] = []
+        page_size = min(1000, self._max_results)
+        offset = 0
+        while len(items) < self._max_results:
+            page = await self._get_json_list_with_retry(
+                client,
+                endpoint,
+                params={
+                    "clean": "true",
+                    "format": "json",
+                    "offset": str(offset),
+                    "limit": str(min(page_size, self._max_results - len(items))),
+                },
+            )
+            items.extend(page)
+            if len(page) < page_size:
+                break
+            offset += len(page)
+        return items[: self._max_results]
+
+    async def _get_json_with_retry(
+        self,
+        client: httpx.AsyncClient,
+        endpoint: str,
+        *,
+        params: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        result = await self._retry_get(client, endpoint, params=params, expect_list=False)
+        if not isinstance(result, dict):
+            raise ProviderError("Apify API returned a non-object JSON response")
+        return result
+
+    async def _get_json_list_with_retry(
+        self,
+        client: httpx.AsyncClient,
+        endpoint: str,
+        *,
+        params: dict[str, str],
+    ) -> list[object]:
+        result = await self._retry_get(client, endpoint, params=params, expect_list=True)
+        if not isinstance(result, list):
+            raise ProviderError("Apify dataset endpoint returned a non-list JSON response")
+        return result
+
+    async def _retry_get(
+        self,
+        client: httpx.AsyncClient,
+        endpoint: str,
+        *,
+        params: dict[str, str] | None,
+        expect_list: bool,
+    ) -> object:
+        retrying = AsyncRetrying(
+            stop=stop_after_attempt(self._retry_attempts),
+            wait=wait_exponential(
+                min=self._retry_min_wait_seconds,
+                max=self._retry_max_wait_seconds,
+            ),
+            retry=retry_if_exception_type(TransientProviderError),
+            reraise=True,
+        )
+        async for attempt in retrying:
+            with attempt:
+                try:
+                    response = await client.get(
+                        endpoint, params=params, headers=self._headers
+                    )
+                except httpx.RequestError as exc:
+                    raise TransientProviderError(
+                        f"Apify GET request failed: {type(exc).__name__}"
+                    ) from exc
+                try:
+                    payload = response.json()
+                except ValueError as exc:
+                    if response.status_code == 429 or response.status_code >= 500:
+                        raise TransientProviderError(
+                            f"Apify returned transient HTTP {response.status_code}"
+                        ) from exc
+                    raise ProviderError(
+                        f"Apify returned non-JSON HTTP {response.status_code}"
+                    ) from exc
+                if response.status_code == 429 or response.status_code >= 500:
+                    raise TransientProviderError(
+                        f"Apify returned transient HTTP {response.status_code}"
+                    )
+                if response.status_code >= 400:
+                    object_payload = payload if isinstance(payload, dict) else {}
+                    raise ProviderError(
+                        _apify_http_error("GET request", response, object_payload)
+                    )
+                if expect_list and not isinstance(payload, list):
+                    raise ProviderError("Apify dataset response was not a JSON list")
+                if not expect_list and not isinstance(payload, dict):
+                    raise ProviderError("Apify API response was not a JSON object")
+                return payload
+        raise RuntimeError("Retry loop ended without an Apify response")
+
+    @staticmethod
+    def _normalize_ad(
+        raw_ad: dict[str, object], region: Region, country: str
+    ) -> MetaAdDetails:
+        ad_id = raw_ad.get("adArchiveID")
+        page_id = raw_ad.get("pageID")
+        page_name = raw_ad.get("pageName")
+        if not isinstance(ad_id, str) or not ad_id:
+            raise ProviderError("Apify ad is missing documented adArchiveID")
+        if not isinstance(page_id, str) or not page_id:
+            raise ProviderError(f"Apify ad {ad_id} is missing documented pageID")
+        if not isinstance(page_name, str) or not page_name:
+            raise ProviderError(f"Apify ad {ad_id} is missing documented pageName")
+        creative_bodies = _string_list(raw_ad.get("adCreativeBodies"))
+        ad_text = raw_ad.get("adText")
+        if isinstance(ad_text, str) and ad_text and ad_text not in creative_bodies:
+            creative_bodies.insert(0, ad_text)
+        return MetaAdDetails(
+            ad_id=ad_id,
+            page_id=page_id,
+            page_name=page_name,
+            ad_creation_time=raw_ad.get("adCreationTime"),
+            ad_delivery_start_time=raw_ad.get("startDate"),
+            ad_delivery_stop_time=raw_ad.get("endDate"),
+            ad_status=(raw_ad.get("adStatus") if isinstance(raw_ad.get("adStatus"), str) else None),
+            ad_library_url=_string_or_none(raw_ad.get("adLibraryURL")),
+            ad_snapshot_url=_sanitize_snapshot_url(raw_ad.get("adSnapshotUrl")),
+            landing_page_url=_string_or_none(raw_ad.get("ctaUrl")),
+            landing_page_domain=_string_or_none(raw_ad.get("ctaDomain")),
+            cta_headline=_string_or_none(raw_ad.get("ctaHeadline")),
+            cta_description=_string_or_none(raw_ad.get("ctaDescription")),
+            cta_text=_string_or_none(raw_ad.get("ctaText")),
+            cta_type=_string_or_none(raw_ad.get("ctaType")),
+            advertiser_page_url=_string_or_none(raw_ad.get("pageURL")),
+            page_profile_picture_url=_string_or_none(
+                raw_ad.get("pageProfilePictureURL")
+            ),
+            advertiser_country=_string_or_none(raw_ad.get("pageCountry")),
+            creative_bodies=creative_bodies,
+            platforms=_string_list(raw_ad.get("publisherPlatforms")),
+            declared_spend=_string_or_none(raw_ad.get("spend")),
+            currency=_string_or_none(raw_ad.get("currency")),
+            impressions=raw_ad.get("impressions"),
+            reach_estimate=_string_or_none(raw_ad.get("reachEstimate")),
+            estimated_audience_size=raw_ad.get("estimatedAudienceSize"),
+            regions_reached=raw_ad.get("regionsReached"),
+            demographics=raw_ad.get("demographics"),
+            source=_string_or_none(raw_ad.get("source")),
+            source_query=_string_or_none(raw_ad.get("sourceQuery")),
+            matched_countries=[country],
+            matched_regions=[region],
+        )
 
 
 class MetaAdLibraryProvider(MetaAdsProvider):
@@ -444,6 +924,81 @@ def _string_list(value: object) -> list[str]:
     return [item for item in value if isinstance(item, str)]
 
 
+def _string_or_none(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _response_json_object(
+    response: httpx.Response, operation: str
+) -> dict[str, object]:
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ProviderError(
+            f"{operation} returned non-JSON HTTP {response.status_code}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ProviderError(f"{operation} returned a non-object JSON response")
+    return payload
+
+
+def _apify_http_error(
+    operation: str, response: httpx.Response, payload: dict[str, object]
+) -> str:
+    error = payload.get("error")
+    message = error.get("message") if isinstance(error, dict) else None
+    suffix = f": {message}" if isinstance(message, str) and message else ""
+    return f"Apify {operation} returned HTTP {response.status_code}{suffix}"
+
+
+def _aggregate_advertisers(
+    ads_by_id: dict[str, MetaAdDetails],
+    *,
+    provider: str,
+    provider_metadata: dict[str, str | int | float | bool | None],
+) -> list[AdRecord]:
+    grouped: dict[str, list[MetaAdDetails]] = defaultdict(list)
+    for ad in ads_by_id.values():
+        grouped[ad.page_id].append(ad)
+
+    records: list[AdRecord] = []
+    for page_id, page_ads in grouped.items():
+        page_ads.sort(
+            key=lambda ad: (
+                ad.ad_delivery_start_time.timestamp()
+                if ad.ad_delivery_start_time is not None
+                else float("-inf")
+            )
+        )
+        regions = list(
+            dict.fromkeys(region for ad in page_ads for region in ad.matched_regions)
+        )
+        active_ads = [
+            ad
+            for ad in page_ads
+            if ad.ad_status is None or ad.ad_status.casefold() == "active"
+        ]
+        start_times = [
+            ad.ad_delivery_start_time
+            for ad in active_ads
+            if ad.ad_delivery_start_time is not None
+        ]
+        records.append(
+            AdRecord(
+                brand=Brand(name=page_ads[0].page_name, source_id=page_id),
+                region=regions[0],
+                regions=regions,
+                estimated_monthly_spend_usd=None,
+                active_ad_count=len(active_ads),
+                oldest_active_ad=min(start_times) if start_times else None,
+                newest_active_ad=max(start_times) if start_times else None,
+                ads=page_ads,
+                provider_metadata={"provider": provider, **provider_metadata},
+            )
+        )
+    return sorted(records, key=lambda record: record.brand.name.casefold())
+
+
 def _sanitize_snapshot_url(value: object) -> str | None:
     """Remove access tokens Meta may embed in documented snapshot URLs."""
 
@@ -464,11 +1019,35 @@ def _merge_duplicate_ad(existing: MetaAdDetails, duplicate: MetaAdDetails) -> Me
     """Keep one Library ID while filling fields absent from an earlier region query."""
 
     updates: dict[str, object] = {
+        "matched_countries": list(
+            dict.fromkeys([*existing.matched_countries, *duplicate.matched_countries])
+        ),
         "matched_regions": list(
             dict.fromkeys([*existing.matched_regions, *duplicate.matched_regions])
         )
     }
     for field_name in (
+        "ad_creation_time",
+        "ad_delivery_start_time",
+        "ad_delivery_stop_time",
+        "ad_status",
+        "ad_library_url",
+        "ad_snapshot_url",
+        "landing_page_url",
+        "landing_page_domain",
+        "cta_headline",
+        "cta_description",
+        "cta_text",
+        "cta_type",
+        "advertiser_page_url",
+        "page_profile_picture_url",
+        "advertiser_country",
+        "creative_bodies",
+        "creative_link_captions",
+        "creative_link_descriptions",
+        "creative_link_titles",
+        "platforms",
+        "languages",
         "eu_total_reach",
         "total_reach_by_location",
         "age_country_gender_reach_breakdown",
@@ -476,6 +1055,15 @@ def _merge_duplicate_ad(existing: MetaAdDetails, duplicate: MetaAdDetails) -> Me
         "target_gender",
         "target_locations",
         "beneficiary_payers",
+        "declared_spend",
+        "currency",
+        "impressions",
+        "reach_estimate",
+        "estimated_audience_size",
+        "regions_reached",
+        "demographics",
+        "source",
+        "source_query",
     ):
         current_value = getattr(existing, field_name)
         duplicate_value = getattr(duplicate, field_name)

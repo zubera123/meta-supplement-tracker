@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     meta_api_version: str = Field(default="v26.0", pattern=r"^v\d+\.\d+$")
     meta_request_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     meta_max_pages_per_query: int = Field(default=100, ge=1, le=10_000)
+    apify_api_token: str | None = None
+    apify_actor_id: str = "solidcode/meta-ads-library-scraper"
+    apify_max_results_per_query: int = Field(default=500, ge=1, le=50_000)
+    apify_monthly_budget_gbp: float = Field(default=30.0, gt=0)
+    apify_budget_gbp_per_usd: float = Field(default=1.0, gt=0)
+    apify_request_timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
     google_service_account_json: str | None = None
     google_doc_id: str | None = None
     instagram_provider: str | None = None

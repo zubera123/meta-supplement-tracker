@@ -23,7 +23,7 @@ class Brand(BaseModel):
 
 
 class MetaAdDetails(BaseModel):
-    """Documented Meta Ad Library fields for one commercial ad."""
+    """Provider-normalized fields for one real Meta Ad Library result."""
 
     ad_id: str = Field(min_length=1)
     page_id: str = Field(min_length=1)
@@ -31,7 +31,18 @@ class MetaAdDetails(BaseModel):
     ad_creation_time: datetime | None = None
     ad_delivery_start_time: datetime | None = None
     ad_delivery_stop_time: datetime | None = None
+    ad_status: str | None = None
+    ad_library_url: str | None = None
     ad_snapshot_url: str | None = None
+    landing_page_url: str | None = None
+    landing_page_domain: str | None = None
+    cta_headline: str | None = None
+    cta_description: str | None = None
+    cta_text: str | None = None
+    cta_type: str | None = None
+    advertiser_page_url: str | None = None
+    page_profile_picture_url: str | None = None
+    advertiser_country: str | None = None
     creative_bodies: list[str] = Field(default_factory=list)
     creative_link_captions: list[str] = Field(default_factory=list)
     creative_link_descriptions: list[str] = Field(default_factory=list)
@@ -45,6 +56,16 @@ class MetaAdDetails(BaseModel):
     target_gender: str | None = None
     target_locations: JsonValue | None = None
     beneficiary_payers: JsonValue | None = None
+    declared_spend: str | None = None
+    currency: str | None = None
+    impressions: JsonValue | None = None
+    reach_estimate: str | None = None
+    estimated_audience_size: int | None = Field(default=None, ge=0)
+    regions_reached: JsonValue | None = None
+    demographics: JsonValue | None = None
+    source: str | None = None
+    source_query: str | None = None
+    matched_countries: list[str] = Field(default_factory=list)
     matched_regions: list[Region] = Field(default_factory=list)
 
 

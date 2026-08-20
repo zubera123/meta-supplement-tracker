@@ -1,6 +1,6 @@
 # Meta Supplement Tracker
 
-Initial production-oriented foundation for discovering supplement brands advertising on Meta. The first real provider uses Meta's official Ad Library API for commercial ads delivered to the UK and European Union, the locations for which Meta currently documents commercial-ad API access.
+Initial production-oriented foundation for discovering supplement brands advertising on Meta. Apify's `solidcode/meta-ads-library-scraper` Actor is the primary commercial discovery provider. Meta's official Ad Library API provider remains available as an alternative for its documented UK/EU coverage.
 
 No external-data integration is simulated. Instagram, reviews, and Google Docs remain explicit provider contracts until verified providers are selected and implemented.
 
@@ -9,7 +9,8 @@ No external-data integration is simulated. Instagram, reviews, and Google Docs r
 - FastAPI service with `GET /` and `GET /health`
 - Environment-based settings with no embedded credentials
 - Typed domain models for brands, ads, social data, reviews, and candidates
-- Official Meta Ad Library API discovery for active UK/EU commercial ads
+- Apify Actor discovery for active commercial ads in the UK, supported EU countries, USA, and Canada
+- Official Meta Ad Library API discovery retained as a UK/EU alternative
 - Cursor pagination, bounded transient retries, ad deduplication, and advertiser aggregation
 - Inclusive qualification filters for estimated monthly spend of $5,000–$30,000 and Instagram audiences of 10,000–100,000
 - Optional 10-point review bonus at 300 reviews; reviews never determine qualification
@@ -72,17 +73,104 @@ Settings are loaded from environment variables and, for local development, `.env
 | `DESIRABLE_TRUSTPILOT_REVIEW_COUNT` | `300` |
 | `SCAN_INTERVAL_HOURS` | `12` |
 | `PROVIDER_RETRY_ATTEMPTS` | `3` |
-| `META_ACCESS_TOKEN` | Required Facebook Developer access token authorised for the Ad Library API |
-| `META_AD_PROVIDER` | `meta_ad_library` |
+| `META_ACCESS_TOKEN` | Required only when `META_AD_PROVIDER=meta_ad_library` |
+| `META_AD_PROVIDER` | `apify` for the primary provider; `meta_ad_library` remains available |
 | `META_API_VERSION` | `v26.0`; update only after reviewing Meta's versioned documentation |
 | `META_REQUEST_TIMEOUT_SECONDS` | `30` |
 | `META_MAX_PAGES_PER_QUERY` | `100`; local safety ceiling, not a Meta rate limit |
+| `APIFY_API_TOKEN` | Required when `META_AD_PROVIDER=apify`; keep it in Railway or local `.env` only |
+| `APIFY_ACTOR_ID` | `solidcode/meta-ads-library-scraper` |
+| `APIFY_MAX_RESULTS_PER_QUERY` | `500`; maximum results for each country Actor run, shared across all search terms |
+| `APIFY_MONTHLY_BUDGET_GBP` | `30`; aborts before starting paid runs when projected monthly usage exceeds this guard |
+| `APIFY_BUDGET_GBP_PER_USD` | `1.0`; conservative conversion applied to Apify's USD usage figures |
+| `APIFY_REQUEST_TIMEOUT_SECONDS` | `120`; overall wait limit for each Actor run |
 | `INSTAGRAM_PROVIDER`, `INSTAGRAM_API_KEY` | Instagram provider placeholders |
 | `REVIEWS_PROVIDER`, `REVIEWS_API_KEY` | Reviews provider placeholders |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | Service-account JSON value or provider-specific reference; pending implementation |
 | `GOOGLE_DOC_ID` | Target Google document ID |
 
 Never commit `.env`, credentials, or service-account files. The supplied `.gitignore` excludes them.
+
+## Apify Meta ads provider
+
+### Setup and documented API contract
+
+Create an Apify account and copy its API token from **Apify Console → Settings → API & Integrations**. Configure it only in `.env` locally or in the Railway service's Variables tab:
+
+```env
+META_AD_PROVIDER=apify
+APIFY_API_TOKEN=<secret Apify API token>
+APIFY_ACTOR_ID=solidcode/meta-ads-library-scraper
+APIFY_MAX_RESULTS_PER_QUERY=500
+APIFY_MONTHLY_BUDGET_GBP=30
+APIFY_BUDGET_GBP_PER_USD=1.0
+APIFY_REQUEST_TIMEOUT_SECONDS=120
+```
+
+The implementation follows the Actor's current [input/output reference and pricing](https://apify.com/solidcode/meta-ads-library-scraper) and [generated OpenAPI definition](https://apify.com/solidcode/meta-ads-library-scraper/api/openapi). It starts runs asynchronously through Apify's documented [Run Actor endpoint](https://docs.apify.com/api/v2/actors-runs-post), polls the [Get run endpoint](https://docs.apify.com/api/v2/actor-run-get), and pages through the [default dataset items endpoint](https://docs.apify.com/api/v2/actor-run-dataset-items-get). Tokens are sent in the recommended `Authorization: Bearer` header, never in URLs or logs.
+
+Each country run sends only documented Actor input fields: `searchTerms`, `country`, `adActiveStatus="ACTIVE"`, `adType="ALL"`, `scrapeAdDetails=true`, `includeAboutPage=false`, `onlyTotalCount=false`, and `maxResults`. Creative-detail enrichment is enabled because it is the documented source of CTA landing URLs and snapshot URLs. Advertiser-page enrichment is deliberately disabled; Instagram data is outside this stage.
+
+The provider retains documented ad IDs, page IDs and names, status, platforms, dates, body copy, Ad Library and snapshot URLs, genuine CTA landing URLs, and real audience fields if present. Commercial spend is not estimated or inferred, so `estimated_monthly_spend_usd` remains `null`. The Actor documents spend, impressions, and several audience disclosures as political/issue-ad-only; if such a real declared range is returned it is preserved separately as `declared_spend`, but ordinary supplement searches must not be assumed to contain it.
+
+### Region handling
+
+The Actor accepts one country code per keyword-search run. This project maps regions as follows:
+
+| Configured region | Actor queries |
+| --- | --- |
+| `UK` | `GB` |
+| `USA` | `US` |
+| `Canada` | `CA` |
+| `Europe` or `EU` | `AT, BE, CZ, DK, FI, FR, DE, GR, HU, IE, IT, NL, PL, PT, RO, ES, SE` |
+
+The current Actor schema does not list `BG, HR, CY, EE, LV, LT, LU, MT, SK, SI`. Those EU countries are logged and skipped rather than sent as undocumented inputs. Results are deduplicated by Meta ad archive ID and then grouped/deduplicated by advertiser page ID across keywords, countries, and regions.
+
+### Cost controls and retries
+
+Current Actor pricing is $0.40 per 1,000 ad rows plus $0.10 per 1,000 rows for the enabled creative details: $0.50 per 1,000 results total. At that configuration, the maximum result charges are $0.50 for 1,000, $5.00 for 10,000, and $25.00 for 50,000 results. Apify bills in USD; these figures exclude any taxes or external currency-conversion effects.
+
+Before any paid run starts, the provider reads `current.monthlyUsageUsd` from Apify's documented [account limits endpoint](https://docs.apify.com/api/v2/users-me-limits-get). It adds the maximum possible cost of all planned country runs, converts that estimate using `APIFY_BUDGET_GBP_PER_USD`, and aborts if the projection exceeds `APIFY_MONTHLY_BUDGET_GBP`. The default `1.0` deliberately treats each reported USD as £1, which is conservative relative to a lower GBP-per-USD rate; update the setting only if you intentionally want another budgeting rate. Every run also receives Apify's documented `maxTotalChargeUsd` server-side cap.
+
+`APIFY_MAX_RESULTS_PER_QUERY` is always positive; unlimited Actor runs are not exposed. Read-only API calls retry bounded transient network, HTTP 429, and server failures. A paid Actor start is not automatically retried after a network error because an ambiguous retry could create a second billable run. Runs exceeding the configured timeout are aborted. The monthly pre-check is deliberately account-wide and fail-closed, but it cannot make independent concurrent processes atomic; use Apify's account spending controls as an additional account-level backstop.
+
+### Manual and Railway live test
+
+With local credentials, run discovery only:
+
+```bash
+python -m app.jobs.brand_scan --meta-only
+```
+
+If the token exists only in Railway, do not copy it locally. After deploying this code, install and authenticate the current Railway CLI, link it to the project/service, then execute a capped test inside the running container:
+
+```bash
+railway ssh -- /bin/sh -lc 'SCAN_REGIONS=UK APIFY_MAX_RESULTS_PER_QUERY=20 python -m app.jobs.brand_scan --meta-only'
+```
+
+Railway's current [`railway ssh` documentation](https://docs.railway.com/cli/ssh) supports running a command in the deployed service. This override performs one UK country run with at most 20 enriched results—a current maximum Actor result charge of $0.01—and does not expose the token. Inspect the JSON output and Railway logs. The command invokes only Meta discovery; it does not run social/review enrichment, Google Docs, scoring output, or scheduling.
+
+A sanitised output shape is:
+
+```json
+[
+  {
+    "brand": {"name": "<page name>", "source_id": "<page id>"},
+    "regions": ["UK"],
+    "estimated_monthly_spend_usd": null,
+    "active_ad_count": 1,
+    "ads": [
+      {
+        "ad_id": "<Meta archive ID>",
+        "ad_status": "ACTIVE",
+        "ad_library_url": "<public Ad Library URL>",
+        "landing_page_url": "<CTA URL when returned>",
+        "matched_countries": ["GB"]
+      }
+    ]
+  }
+]
+```
 
 ## Meta Ad Library API
 
@@ -191,7 +279,7 @@ python -m pytest
 
 ## Provider architecture and scan job
 
-Provider contracts live under `app/services/`. Implementations normalize verified provider responses into the models in `app/models.py`. `MetaAdLibraryProvider` is the first concrete implementation.
+Provider contracts live under `app/services/`. Implementations normalize verified provider responses into the models in `app/models.py`. `ApifyMetaAdsProvider` is selected by `META_AD_PROVIDER=apify`; `MetaAdLibraryProvider` remains selectable with `META_AD_PROVIDER=meta_ad_library`.
 
 `BrandScanJob` accepts provider instances through its constructor. A run retrieves advertisers for every configured region and category, enriches each brand with Instagram and optional review data, evaluates it, and writes the complete qualifying set to the output provider. Provider calls that raise `TransientProviderError` use bounded exponential retries. Configuration and programming errors fail immediately. A failed optional enrichment is logged and treated as unavailable; retrieval and output failures abort the run so failures remain visible.
 
@@ -218,7 +306,7 @@ No Railway deployment is performed by this project setup.
 ## Unimplemented integrations
 
 - Defensible commercial Meta spend estimation; the official Ad Library API does not return commercial spend
-- Commercial Meta discovery outside the UK/EU official API coverage
+- EU countries absent from the current SolidCode Actor country schema
 - Instagram follower enrichment
 - Trustpilot or other reviews enrichment
 - Google Docs authentication and writes

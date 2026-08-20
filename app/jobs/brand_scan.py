@@ -15,7 +15,11 @@ from app.models import Brand, BrandCandidate, ReviewStats, SocialStats
 from app.services import ProviderError, TransientProviderError
 from app.services.google_docs import BrandOutputProvider
 from app.services.instagram import InstagramProvider
-from app.services.meta_ads import MetaAdLibraryProvider, MetaAdsProvider
+from app.services.meta_ads import (
+    ApifyMetaAdsProvider,
+    MetaAdLibraryProvider,
+    MetaAdsProvider,
+)
 from app.services.reviews import ReviewsProvider
 from app.services.scoring import CandidateScorer
 
@@ -110,19 +114,32 @@ class BrandScanJob:
 
 async def _run_meta_only(settings: Settings) -> int:
     configured_provider = (settings.meta_ad_provider or "meta_ad_library").casefold()
-    if configured_provider != "meta_ad_library":
+    if configured_provider == "apify":
+        provider: MetaAdsProvider = ApifyMetaAdsProvider(
+            api_token=settings.apify_api_token,
+            actor_id=settings.apify_actor_id,
+            max_results_per_query=settings.apify_max_results_per_query,
+            monthly_budget_gbp=settings.apify_monthly_budget_gbp,
+            budget_gbp_per_usd=settings.apify_budget_gbp_per_usd,
+            request_timeout_seconds=settings.apify_request_timeout_seconds,
+            retry_attempts=settings.provider_retry_attempts,
+            retry_min_wait_seconds=settings.provider_retry_min_wait_seconds,
+            retry_max_wait_seconds=settings.provider_retry_max_wait_seconds,
+        )
+    elif configured_provider == "meta_ad_library":
+        provider = MetaAdLibraryProvider(
+            access_token=settings.meta_access_token,
+            api_version=settings.meta_api_version,
+            request_timeout_seconds=settings.meta_request_timeout_seconds,
+            max_pages_per_query=settings.meta_max_pages_per_query,
+            retry_attempts=settings.provider_retry_attempts,
+            retry_min_wait_seconds=settings.provider_retry_min_wait_seconds,
+            retry_max_wait_seconds=settings.provider_retry_max_wait_seconds,
+        )
+    else:
         raise ProviderError(
             f"Unsupported META_AD_PROVIDER for --meta-only: {settings.meta_ad_provider}"
         )
-    provider = MetaAdLibraryProvider(
-        access_token=settings.meta_access_token,
-        api_version=settings.meta_api_version,
-        request_timeout_seconds=settings.meta_request_timeout_seconds,
-        max_pages_per_query=settings.meta_max_pages_per_query,
-        retry_attempts=settings.provider_retry_attempts,
-        retry_min_wait_seconds=settings.provider_retry_min_wait_seconds,
-        retry_max_wait_seconds=settings.provider_retry_max_wait_seconds,
-    )
     records = await provider.retrieve_advertisers(
         regions=settings.regions,
         categories=settings.categories,
