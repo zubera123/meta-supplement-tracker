@@ -119,6 +119,9 @@ async def _run_meta_only(settings: Settings) -> int:
             api_token=settings.apify_api_token,
             actor_id=settings.apify_actor_id,
             max_results_per_query=settings.apify_max_results_per_query,
+            max_total_charge_usd_per_run=(
+                settings.apify_max_total_charge_usd_per_run
+            ),
             monthly_budget_gbp=settings.apify_monthly_budget_gbp,
             budget_gbp_per_usd=settings.apify_budget_gbp_per_usd,
             request_timeout_seconds=settings.apify_request_timeout_seconds,

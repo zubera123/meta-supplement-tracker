@@ -114,11 +114,6 @@ APIFY_REGION_COUNTRIES: dict[str, tuple[Region, tuple[str, ...]]] = {
     "usa": (Region.USA, ("US",)),
     "canada": (Region.CANADA, ("CA",)),
 }
-APIFY_AD_RESULT_USD = Decimal("0.0004")
-APIFY_CREATIVE_DETAILS_USD = Decimal("0.0001")
-APIFY_RESULT_WITH_CREATIVE_USD = (
-    APIFY_AD_RESULT_USD + APIFY_CREATIVE_DETAILS_USD
-)
 _APIFY_TERMINAL_STATUSES = {
     "SUCCEEDED",
     "FAILED",
@@ -155,6 +150,7 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
         api_token: str | None,
         actor_id: str = "solidcode/meta-ads-library-scraper",
         max_results_per_query: int = 500,
+        max_total_charge_usd_per_run: float = 0.02,
         monthly_budget_gbp: float = 30.0,
         budget_gbp_per_usd: float = 1.0,
         request_timeout_seconds: float = 120.0,
@@ -173,9 +169,21 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
             raise ProviderConfigurationError(
                 "APIFY_MAX_RESULTS_PER_QUERY must be at least 1"
             )
+        if max_total_charge_usd_per_run <= 0:
+            raise ProviderConfigurationError(
+                "APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN must be greater than 0"
+            )
         if monthly_budget_gbp <= 0 or budget_gbp_per_usd <= 0:
             raise ProviderConfigurationError(
                 "Apify budget and GBP-per-USD conversion must be positive"
+            )
+        max_charge_usd = Decimal(str(max_total_charge_usd_per_run))
+        monthly_budget = Decimal(str(monthly_budget_gbp))
+        gbp_per_usd = Decimal(str(budget_gbp_per_usd))
+        if max_charge_usd * gbp_per_usd > monthly_budget:
+            raise ProviderConfigurationError(
+                "APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN exceeds the configured "
+                "monthly GBP budget after conversion"
             )
         self._api_token = api_token
         self._headers = {"Authorization": f"Bearer {api_token}"}
@@ -183,8 +191,9 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
         actor_ref = self._actor_id.replace("/", "~")
         self._actor_ref = quote(actor_ref, safe="~")
         self._max_results = max_results_per_query
-        self._monthly_budget_gbp = Decimal(str(monthly_budget_gbp))
-        self._gbp_per_usd = Decimal(str(budget_gbp_per_usd))
+        self._max_total_charge_usd_per_run = max_charge_usd
+        self._monthly_budget_gbp = monthly_budget
+        self._gbp_per_usd = gbp_per_usd
         self._request_timeout_seconds = request_timeout_seconds
         self._retry_attempts = retry_attempts
         self._retry_min_wait_seconds = retry_min_wait_seconds
@@ -208,10 +217,9 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
             for region, countries in resolved_regions
             for country in countries
         ]
-        maximum_run_cost_usd = (
-            Decimal(self._max_results) * APIFY_RESULT_WITH_CREATIVE_USD
+        planned_cost_usd = (
+            self._max_total_charge_usd_per_run * len(country_queries)
         )
-        planned_cost_usd = maximum_run_cost_usd * len(country_queries)
 
         if self._client is not None:
             ads = await self._retrieve_with_client(
@@ -219,7 +227,6 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
                 country_queries,
                 keywords,
                 planned_cost_usd,
-                maximum_run_cost_usd,
             )
         else:
             async with httpx.AsyncClient(
@@ -232,7 +239,6 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
                     country_queries,
                     keywords,
                     planned_cost_usd,
-                    maximum_run_cost_usd,
                 )
         return _aggregate_advertisers(
             ads,
@@ -240,6 +246,9 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
             provider_metadata={
                 "actor_id": self._actor_id,
                 "commercial_spend_available": False,
+                "max_total_charge_usd_per_run": float(
+                    self._max_total_charge_usd_per_run
+                ),
             },
         )
 
@@ -287,7 +296,6 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
         country_queries: Sequence[tuple[Region, str]],
         keywords: Sequence[str],
         planned_cost_usd: Decimal,
-        maximum_run_cost_usd: Decimal,
     ) -> dict[str, MetaAdDetails]:
         current_usage_usd = await self._get_monthly_usage_usd(client)
         projected_gbp = (current_usage_usd + planned_cost_usd) * self._gbp_per_usd
@@ -312,7 +320,6 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
                 client,
                 country=country,
                 keywords=keywords,
-                maximum_run_cost_usd=maximum_run_cost_usd,
             )
             for index, item in enumerate(raw_items):
                 if not isinstance(item, dict):
@@ -354,7 +361,6 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
         *,
         country: str,
         keywords: Sequence[str],
-        maximum_run_cost_usd: Decimal,
     ) -> list[object]:
         endpoint = f"{self._api_base}/acts/{self._actor_ref}/runs"
         actor_input = {
@@ -369,7 +375,9 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
         }
         params = {
             "timeout": str(max(1, int(self._request_timeout_seconds))),
-            "maxTotalChargeUsd": format(maximum_run_cost_usd, "f"),
+            "maxTotalChargeUsd": format(
+                self._max_total_charge_usd_per_run, "f"
+            ),
         }
         try:
             response = await client.post(

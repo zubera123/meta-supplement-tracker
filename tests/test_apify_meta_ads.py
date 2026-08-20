@@ -6,9 +6,11 @@ import logging
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
+from app.config import Settings
 from app.models import Region
-from app.services import ProviderError
+from app.services import ProviderConfigurationError, ProviderError
 from app.services.meta_ads import (
     APIFY_EU_COUNTRY_CODES,
     APIFY_UNAVAILABLE_EU_COUNTRY_CODES,
@@ -55,6 +57,7 @@ def run_provider(
     *,
     regions: list[str] | None = None,
     max_results: int = 500,
+    max_charge_usd: float = 0.02,
     monthly_budget_gbp: float = 30,
     timeout: float = 120,
 ) -> list:
@@ -64,6 +67,7 @@ def run_provider(
                 api_token="test-token",
                 client=client,
                 max_results_per_query=max_results,
+                max_total_charge_usd_per_run=max_charge_usd,
                 monthly_budget_gbp=monthly_budget_gbp,
                 request_timeout_seconds=timeout,
                 retry_attempts=2,
@@ -128,7 +132,7 @@ def test_successful_actor_run_uses_documented_contract_and_normalizes() -> None:
                 "onlyTotalCount": False,
                 "maxResults": 500,
             }
-            assert request.url.params["maxTotalChargeUsd"] == "0.2500"
+            assert request.url.params["maxTotalChargeUsd"] == "0.02"
             return httpx.Response(201, json={"data": {"id": "run-1"}})
         if request.url.path == "/v2/actor-runs/run-1":
             return httpx.Response(
@@ -158,6 +162,78 @@ def test_successful_actor_run_uses_documented_contract_and_normalizes() -> None:
     assert record.ads[0].matched_countries == ["GB"]
     assert all(request.headers["authorization"] == "Bearer test-token" for request in requests)
     assert all("token" not in request.url.params for request in requests)
+
+
+def test_default_per_run_charge_ceiling() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.apify_max_total_charge_usd_per_run == 0.02
+
+
+def test_per_run_charge_ceiling_environment_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN", "0.07")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.apify_max_total_charge_usd_per_run == 0.07
+
+
+def test_invalid_per_run_charge_ceiling_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN", "0")
+
+    with pytest.raises(ValidationError, match="greater than 0"):
+        Settings(_env_file=None)
+
+    with pytest.raises(ProviderConfigurationError, match="must be greater than 0"):
+        ApifyMetaAdsProvider(
+            api_token="test-token", max_total_charge_usd_per_run=-0.01
+        )
+
+
+def test_per_run_ceiling_cannot_exceed_monthly_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN", "30.01")
+    monkeypatch.setenv("APIFY_MONTHLY_BUDGET_GBP", "30")
+    monkeypatch.setenv("APIFY_BUDGET_GBP_PER_USD", "1")
+
+    with pytest.raises(ValidationError, match="exceeds APIFY_MONTHLY_BUDGET_GBP"):
+        Settings(_env_file=None)
+
+
+def test_actor_request_uses_configured_per_run_ceiling() -> None:
+    requested_ceiling: str | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requested_ceiling
+        if request.url.path == "/v2/users/me/limits":
+            return httpx.Response(
+                200, json={"data": {"current": {"monthlyUsageUsd": 0}}}
+            )
+        if request.url.path.endswith("/runs"):
+            requested_ceiling = request.url.params["maxTotalChargeUsd"]
+            return httpx.Response(201, json={"data": {"id": "run-1"}})
+        if request.url.path == "/v2/actor-runs/run-1":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "status": "SUCCEEDED",
+                        "defaultDatasetId": "dataset-1",
+                    }
+                },
+            )
+        if request.url.path == "/v2/datasets/dataset-1/items":
+            return httpx.Response(200, json=[])
+        raise AssertionError(f"Unexpected request: {request.url}")
+
+    run_provider(httpx.MockTransport(handler), max_charge_usd=0.07)
+
+    assert requested_ceiling == "0.07"
 
 
 def test_empty_results_return_no_advertisers() -> None:
@@ -300,7 +376,7 @@ def test_budget_guard_fails_before_starting_actor() -> None:
         requests.append(request)
         if request.url.path == "/v2/users/me/limits":
             return httpx.Response(
-                200, json={"data": {"current": {"monthlyUsageUsd": 29.90}}}
+                200, json={"data": {"current": {"monthlyUsageUsd": 29.99}}}
             )
         raise AssertionError("Actor must not start after budget guard rejects the plan")
 

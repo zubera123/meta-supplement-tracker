@@ -1,8 +1,9 @@
 """Environment-backed application settings."""
 
 from functools import lru_cache
+from typing import Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -48,6 +49,7 @@ class Settings(BaseSettings):
     apify_api_token: str | None = None
     apify_actor_id: str = "solidcode/meta-ads-library-scraper"
     apify_max_results_per_query: int = Field(default=500, ge=1, le=50_000)
+    apify_max_total_charge_usd_per_run: float = Field(default=0.02, gt=0)
     apify_monthly_budget_gbp: float = Field(default=30.0, gt=0)
     apify_budget_gbp_per_usd: float = Field(default=1.0, gt=0)
     apify_request_timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
@@ -57,6 +59,21 @@ class Settings(BaseSettings):
     instagram_api_key: str | None = None
     reviews_provider: str | None = None
     reviews_api_key: str | None = None
+
+    @model_validator(mode="after")
+    def validate_apify_charge_ceiling(self) -> Self:
+        """Reject a single-run ceiling that already exceeds the monthly guard."""
+
+        ceiling_gbp = (
+            self.apify_max_total_charge_usd_per_run
+            * self.apify_budget_gbp_per_usd
+        )
+        if ceiling_gbp > self.apify_monthly_budget_gbp:
+            raise ValueError(
+                "APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN exceeds "
+                "APIFY_MONTHLY_BUDGET_GBP after conversion"
+            )
+        return self
 
     @property
     def regions(self) -> tuple[str, ...]:

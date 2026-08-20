@@ -81,6 +81,7 @@ Settings are loaded from environment variables and, for local development, `.env
 | `APIFY_API_TOKEN` | Required when `META_AD_PROVIDER=apify`; keep it in Railway or local `.env` only |
 | `APIFY_ACTOR_ID` | `solidcode/meta-ads-library-scraper` |
 | `APIFY_MAX_RESULTS_PER_QUERY` | `500`; maximum results for each country Actor run, shared across all search terms |
+| `APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN` | `0.02`; server-side ceiling for each Actor run |
 | `APIFY_MONTHLY_BUDGET_GBP` | `30`; aborts before starting paid runs when projected monthly usage exceeds this guard |
 | `APIFY_BUDGET_GBP_PER_USD` | `1.0`; conservative conversion applied to Apify's USD usage figures |
 | `APIFY_REQUEST_TIMEOUT_SECONDS` | `120`; overall wait limit for each Actor run |
@@ -102,6 +103,7 @@ META_AD_PROVIDER=apify
 APIFY_API_TOKEN=<secret Apify API token>
 APIFY_ACTOR_ID=solidcode/meta-ads-library-scraper
 APIFY_MAX_RESULTS_PER_QUERY=500
+APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN=0.02
 APIFY_MONTHLY_BUDGET_GBP=30
 APIFY_BUDGET_GBP_PER_USD=1.0
 APIFY_REQUEST_TIMEOUT_SECONDS=120
@@ -130,9 +132,9 @@ The current Actor schema does not list `BG, HR, CY, EE, LV, LT, LU, MT, SK, SI`.
 
 Current Actor pricing is $0.40 per 1,000 ad rows plus $0.10 per 1,000 rows for the enabled creative details: $0.50 per 1,000 results total. At that configuration, the maximum result charges are $0.50 for 1,000, $5.00 for 10,000, and $25.00 for 50,000 results. Apify bills in USD; these figures exclude any taxes or external currency-conversion effects.
 
-Before any paid run starts, the provider reads `current.monthlyUsageUsd` from Apify's documented [account limits endpoint](https://docs.apify.com/api/v2/users-me-limits-get). It adds the maximum possible cost of all planned country runs, converts that estimate using `APIFY_BUDGET_GBP_PER_USD`, and aborts if the projection exceeds `APIFY_MONTHLY_BUDGET_GBP`. The default `1.0` deliberately treats each reported USD as £1, which is conservative relative to a lower GBP-per-USD rate; update the setting only if you intentionally want another budgeting rate. Every run also receives Apify's documented `maxTotalChargeUsd` server-side cap.
+Before any paid run starts, the provider reads `current.monthlyUsageUsd` from Apify's documented [account limits endpoint](https://docs.apify.com/api/v2/users-me-limits-get). It reserves `APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN` for every planned country run, converts the projected account usage using `APIFY_BUDGET_GBP_PER_USD`, and aborts if the total exceeds `APIFY_MONTHLY_BUDGET_GBP`. The default `1.0` deliberately treats each reported USD as £1, which is conservative relative to a lower GBP-per-USD rate; update the setting only if you intentionally want another budgeting rate. Every run receives the configured ceiling through Apify's documented `maxTotalChargeUsd` server-side parameter.
 
-`APIFY_MAX_RESULTS_PER_QUERY` is always positive; unlimited Actor runs are not exposed. Read-only API calls retry bounded transient network, HTTP 429, and server failures. A paid Actor start is not automatically retried after a network error because an ambiguous retry could create a second billable run. Runs exceeding the configured timeout are aborted. The monthly pre-check is deliberately account-wide and fail-closed, but it cannot make independent concurrent processes atomic; use Apify's account spending controls as an additional account-level backstop.
+The per-run ceiling defaults to a conservative `$0.02` and is independent of the result-count limit. A low ceiling can intentionally stop a large requested result set before all rows are collected. Non-positive ceilings and a single-run ceiling above the converted monthly budget are rejected during configuration; the full multi-country conflict is checked against live monthly usage immediately before any paid run starts. `APIFY_MAX_RESULTS_PER_QUERY` is always positive, so unlimited Actor runs are not exposed. Read-only API calls retry bounded transient network, HTTP 429, and server failures. A paid Actor start is not automatically retried after a network error because an ambiguous retry could create a second billable run. Runs exceeding the configured timeout are aborted. The monthly pre-check is deliberately account-wide and fail-closed, but it cannot make independent concurrent processes atomic; use Apify's account spending controls as an additional account-level backstop.
 
 ### Manual and Railway live test
 
@@ -145,10 +147,10 @@ python -m app.jobs.brand_scan --meta-only
 If the token exists only in Railway, do not copy it locally. After deploying this code, install and authenticate the current Railway CLI, link it to the project/service, then execute a capped test inside the running container:
 
 ```bash
-railway ssh -- /bin/sh -lc 'SCAN_REGIONS=UK APIFY_MAX_RESULTS_PER_QUERY=20 python -m app.jobs.brand_scan --meta-only'
+railway ssh -- env SCAN_REGIONS=UK APIFY_MAX_RESULTS_PER_QUERY=20 APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN=0.02 python -m app.jobs.brand_scan --meta-only
 ```
 
-Railway's current [`railway ssh` documentation](https://docs.railway.com/cli/ssh) supports running a command in the deployed service. This override performs one UK country run with at most 20 enriched results—a current maximum Actor result charge of $0.01—and does not expose the token. Inspect the JSON output and Railway logs. The command invokes only Meta discovery; it does not run social/review enrichment, Google Docs, scoring output, or scheduling.
+Railway's current [`railway ssh` documentation](https://docs.railway.com/cli/ssh) supports running a command in the deployed service. This override performs one UK country run with at most 20 enriched results, an intended result charge of approximately $0.01, and a hard total run ceiling of $0.02. It does not expose the token. Inspect the JSON output and Railway logs. The command invokes only Meta discovery; it does not run social/review enrichment, Google Docs, scoring output, or scheduling.
 
 A sanitised output shape is:
 
