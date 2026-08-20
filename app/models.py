@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, JsonValue
 
 
 class Region(StrEnum):
@@ -22,13 +22,43 @@ class Brand(BaseModel):
     source_id: str | None = None
 
 
+class MetaAdDetails(BaseModel):
+    """Documented Meta Ad Library fields for one commercial ad."""
+
+    ad_id: str = Field(min_length=1)
+    page_id: str = Field(min_length=1)
+    page_name: str = Field(min_length=1)
+    ad_creation_time: datetime | None = None
+    ad_delivery_start_time: datetime | None = None
+    ad_delivery_stop_time: datetime | None = None
+    ad_snapshot_url: str | None = None
+    creative_bodies: list[str] = Field(default_factory=list)
+    creative_link_captions: list[str] = Field(default_factory=list)
+    creative_link_descriptions: list[str] = Field(default_factory=list)
+    creative_link_titles: list[str] = Field(default_factory=list)
+    platforms: list[str] = Field(default_factory=list)
+    languages: list[str] = Field(default_factory=list)
+    eu_total_reach: int | None = Field(default=None, ge=0)
+    total_reach_by_location: JsonValue | None = None
+    age_country_gender_reach_breakdown: JsonValue | None = None
+    target_ages: list[str] = Field(default_factory=list)
+    target_gender: str | None = None
+    target_locations: JsonValue | None = None
+    beneficiary_payers: JsonValue | None = None
+    matched_regions: list[Region] = Field(default_factory=list)
+
+
 class AdRecord(BaseModel):
-    """Provider-normalized advertising data for one brand."""
+    """Provider-normalized, advertiser-level advertising data."""
 
     brand: Brand
     region: Region
+    regions: list[Region] = Field(default_factory=list)
     estimated_monthly_spend_usd: float | None = Field(default=None, ge=0)
     active_ad_count: int | None = Field(default=None, ge=0)
+    oldest_active_ad: datetime | None = None
+    newest_active_ad: datetime | None = None
+    ads: list[MetaAdDetails] = Field(default_factory=list)
     observed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     provider_metadata: dict[str, str | int | float | bool | None] = Field(
         default_factory=dict

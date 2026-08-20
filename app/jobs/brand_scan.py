@@ -1,17 +1,21 @@
-"""Orchestration skeleton for a complete supplement-brand scan."""
+"""Brand scan orchestration and a manual Meta-only discovery command."""
 
+import argparse
+import asyncio
+import json
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from typing import TypeVar
 
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from app.config import Settings
+from app.config import Settings, get_settings
+from app.logging_config import configure_logging
 from app.models import Brand, BrandCandidate, ReviewStats, SocialStats
-from app.services import TransientProviderError
+from app.services import ProviderError, TransientProviderError
 from app.services.google_docs import BrandOutputProvider
 from app.services.instagram import InstagramProvider
-from app.services.meta_ads import MetaAdsProvider
+from app.services.meta_ads import MetaAdLibraryProvider, MetaAdsProvider
 from app.services.reviews import ReviewsProvider
 from app.services.scoring import CandidateScorer
 
@@ -102,3 +106,50 @@ class BrandScanJob:
             extra={"advertisers": len(ad_records), "qualifying": len(qualifying)},
         )
         return qualifying
+
+
+async def _run_meta_only(settings: Settings) -> int:
+    configured_provider = (settings.meta_ad_provider or "meta_ad_library").casefold()
+    if configured_provider != "meta_ad_library":
+        raise ProviderError(
+            f"Unsupported META_AD_PROVIDER for --meta-only: {settings.meta_ad_provider}"
+        )
+    provider = MetaAdLibraryProvider(
+        access_token=settings.meta_access_token,
+        api_version=settings.meta_api_version,
+        request_timeout_seconds=settings.meta_request_timeout_seconds,
+        max_pages_per_query=settings.meta_max_pages_per_query,
+        retry_attempts=settings.provider_retry_attempts,
+        retry_min_wait_seconds=settings.provider_retry_min_wait_seconds,
+        retry_max_wait_seconds=settings.provider_retry_max_wait_seconds,
+    )
+    records = await provider.retrieve_advertisers(
+        regions=settings.regions,
+        categories=settings.categories,
+    )
+    print(json.dumps([record.model_dump(mode="json") for record in records], indent=2))
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Meta Supplement Tracker scan utilities")
+    parser.add_argument(
+        "--meta-only",
+        action="store_true",
+        help="Run documented Meta Ad Library discovery without other enrichments",
+    )
+    args = parser.parse_args()
+    if not args.meta_only:
+        parser.error("Only --meta-only is available until the remaining providers exist")
+
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    try:
+        return asyncio.run(_run_meta_only(settings))
+    except ProviderError as exc:
+        logger.error("Meta-only scan failed: %s", exc)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
