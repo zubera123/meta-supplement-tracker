@@ -3,7 +3,7 @@
 import logging
 from collections.abc import Sequence
 
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -14,7 +14,18 @@ from app.db.session import (
     create_database_engine,
     create_session_factory,
 )
-from app.models import AdRecord, RelevanceResult, SheetCandidate, SheetRowState
+from app.db.models import Ad, Advertiser, AdvertiserObservation, GoogleSheetRow
+from app.models import (
+    AdRecord,
+    Brand,
+    MetaAdDetails,
+    Region,
+    RelevanceResult,
+    SheetCandidate,
+    SheetRowState,
+    SpendHistory,
+)
+from app.services.spend_estimation import format_spend_range
 
 
 logger = logging.getLogger(__name__)
@@ -180,6 +191,12 @@ class ScanPersistenceService:
                                 if record.active_ad_count is not None
                                 else len(record.ads)
                             ),
+                            spend_estimate=format_spend_range(record.spend_estimate),
+                            spend_source=(
+                                record.spend_estimate.source
+                                if record.spend_estimate is not None
+                                else "Unknown"
+                            ),
                         )
                     )
                 states = repository.sheet_row_states(
@@ -189,6 +206,108 @@ class ScanPersistenceService:
         except SQLAlchemyError as exc:
             raise DatabasePersistenceError(
                 "Could not prepare candidates for Google Sheets"
+            ) from exc
+
+    def load_spend_histories(
+        self, records: Sequence[AdRecord]
+    ) -> list[SpendHistory]:
+        """Load prior observations in record order without mutating the database."""
+
+        try:
+            with self._session_factory() as session:
+                repository = ScanRepository(session)
+                histories: list[SpendHistory] = []
+                for record in records:
+                    advertiser = repository.find_advertiser(record)
+                    if advertiser is None:
+                        histories.append(SpendHistory())
+                        continue
+                    counts = list(
+                        session.scalars(
+                            select(AdvertiserObservation.active_ad_count)
+                            .where(AdvertiserObservation.advertiser_id == advertiser.id)
+                            .order_by(AdvertiserObservation.observed_at)
+                        )
+                    )
+                    histories.append(
+                        SpendHistory(
+                            observation_count=len(counts),
+                            active_ad_counts=counts,
+                        )
+                    )
+                return histories
+        except SQLAlchemyError as exc:
+            raise DatabasePersistenceError(
+                "Could not load advertiser activity history"
+            ) from exc
+
+    def load_spend_dry_run_records(
+        self,
+    ) -> tuple[list[AdRecord], list[SpendHistory]]:
+        """Reconstruct only observed DB activity for a no-provider estimate preview."""
+
+        try:
+            with self._session_factory() as session:
+                advertisers = list(session.scalars(select(Advertiser)))
+                records: list[AdRecord] = []
+                histories: list[SpendHistory] = []
+                for advertiser in advertisers:
+                    ads = list(
+                        session.scalars(
+                            select(Ad).where(Ad.advertiser_id == advertiser.id)
+                        )
+                    )
+                    observations = list(
+                        session.scalars(
+                            select(AdvertiserObservation)
+                            .where(AdvertiserObservation.advertiser_id == advertiser.id)
+                            .order_by(AdvertiserObservation.observed_at)
+                        )
+                    )
+                    if not observations:
+                        continue
+                    sheet_row = session.scalar(
+                        select(GoogleSheetRow).where(
+                            GoogleSheetRow.advertiser_id == advertiser.id
+                        )
+                    )
+                    regions = _stored_regions(
+                        sheet_row.last_exported_region if sheet_row else None
+                    )
+                    records.append(
+                        AdRecord(
+                            brand=Brand(
+                                name=advertiser.page_name,
+                                source_id=advertiser.meta_page_id,
+                                instagram_handle=advertiser.instagram_username,
+                            ),
+                            region=regions[0],
+                            regions=regions,
+                            active_ad_count=observations[-1].active_ad_count,
+                            ads=[
+                                MetaAdDetails(
+                                    ad_id=ad.meta_ad_id,
+                                    page_id=advertiser.meta_page_id or f"db-{advertiser.id}",
+                                    page_name=advertiser.page_name,
+                                    ad_delivery_start_time=ad.ad_start_date,
+                                    ad_snapshot_url=ad.snapshot_url,
+                                    creative_bodies=[ad.ad_text] if ad.ad_text else [],
+                                )
+                                for ad in ads
+                            ],
+                            observed_at=observations[-1].observed_at,
+                        )
+                    )
+                    histories.append(
+                        SpendHistory(
+                            observation_count=len(observations),
+                            active_ad_counts=[item.active_ad_count for item in observations],
+                        )
+                    )
+                return records, histories
+        except SQLAlchemyError as exc:
+            raise DatabasePersistenceError(
+                "Could not load existing advertiser data for spend dry-run"
             ) from exc
 
     def save_sheet_row_states(self, states: Sequence[SheetRowState]) -> None:
@@ -210,3 +329,17 @@ class ScanPersistenceService:
 def _readable_region(record: AdRecord) -> str:
     regions = record.regions or [record.region]
     return ", ".join(dict.fromkeys(region.value for region in regions))
+
+
+def _stored_regions(value: str | None) -> list[Region]:
+    if value:
+        parsed = [
+            region
+            for item in value.split(",")
+            if (region := next((r for r in Region if r.value == item.strip()), None))
+        ]
+        if parsed:
+            return parsed
+    # Region was not persisted on historical advertiser/ad rows. Use the full
+    # configured region envelope rather than guessing a specific location.
+    return [Region.EUROPE, Region.UK, Region.USA, Region.CANADA]

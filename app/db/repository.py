@@ -207,6 +207,30 @@ class ScanRepository:
                 relevance.is_relevant if relevance is not None else None
             ),
             relevance_reason=relevance.reason if relevance is not None else None,
+            spend_estimate_low_usd=(
+                record.spend_estimate.low_usd if record.spend_estimate else None
+            ),
+            spend_estimate_high_usd=(
+                record.spend_estimate.high_usd if record.spend_estimate else None
+            ),
+            spend_estimation_method=(
+                record.spend_estimate.method if record.spend_estimate else None
+            ),
+            spend_estimation_source=(
+                record.spend_estimate.source if record.spend_estimate else None
+            ),
+            spend_estimation_confidence=(
+                record.spend_estimate.confidence if record.spend_estimate else None
+            ),
+            spend_estimation_inputs=(
+                record.spend_estimate.observed_inputs if record.spend_estimate else None
+            ),
+            spend_estimation_assumptions=(
+                record.spend_estimate.assumptions if record.spend_estimate else None
+            ),
+            spend_target_match=(
+                record.spend_estimate.target_match if record.spend_estimate else None
+            ),
             observed_at=record.observed_at,
         )
         self.session.add(observation)

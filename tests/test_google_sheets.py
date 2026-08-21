@@ -160,7 +160,7 @@ class FakeSheetsApi:
             match = re.search(r"!A(\d+):([A-Z])(\d+)$", update["range"])
             assert match is not None
             row_number = int(match.group(1))
-            width = 6 if match.group(2) == "F" else 10
+            width = {"F": 6, "H": 8, "J": 10}[match.group(2)]
             while len(self.rows) < row_number:
                 self.rows.append([])
             existing = (self.rows[row_number - 1] + [""] * 10)[:10]
@@ -334,6 +334,31 @@ def test_existing_spend_and_review_values_are_preserved() -> None:
     assert api.rows[1][6:10] == future_values
     written_range = api.batch_value_updates[0][0]["range"]
     assert written_range.endswith("!A2:F2")
+
+
+def test_spend_columns_update_while_review_columns_are_preserved() -> None:
+    api = FakeSheetsApi(
+        rows=[
+            list(SHEET_HEADERS),
+            [
+                "2026-08-01", "Example Supplements", "UK", "@example_supplements",
+                20_000, 2, "$1k–$2k/mo", "Old model", 450, "Trustpilot",
+            ],
+        ]
+    )
+    updated = candidate().model_copy(
+        update={
+            "spend_estimate": "$8k–$14k/mo",
+            "spend_source": "Activity model - very rough",
+        }
+    )
+
+    provider(api).sync_candidates([updated], {1: row_state()})
+
+    assert api.rows[1][6:10] == [
+        "$8k–$14k/mo", "Activity model - very rough", 450, "Trustpilot"
+    ]
+    assert api.batch_value_updates[0][0]["range"].endswith("!A2:H2")
 
 
 def test_unknown_username_does_not_blank_existing_sheet_value() -> None:

@@ -40,6 +40,7 @@ from app.services.reviews import ReviewsProvider
 from app.services.relevance import SupplementRelevanceFilter
 from app.services.scoring import CandidateScorer
 from app.services.scoring import instagram_follower_filter
+from app.services.spend_estimation import SpendEstimator, format_spend_range
 
 
 logger = logging.getLogger(__name__)
@@ -153,6 +154,7 @@ class CandidatePipeline:
         persistence: ScanPersistenceService | None,
         sheets: GoogleSheetsProvider | None,
         relevance_filter: SupplementRelevanceFilter | None = None,
+        spend_estimator: SpendEstimator | None = None,
     ) -> None:
         if sheets is not None and persistence is None:
             raise ProviderConfigurationError(
@@ -163,6 +165,7 @@ class CandidatePipeline:
         self.persistence = persistence
         self.sheets = sheets
         self.relevance_filter = relevance_filter or SupplementRelevanceFilter()
+        self.spend_estimator = spend_estimator or SpendEstimator(settings)
 
     async def run(self) -> CandidatePipelineResult:
         """Execute once; paid Meta retrieval is intentionally invoked only once."""
@@ -188,6 +191,19 @@ class CandidatePipeline:
                 regions=self.settings.regions,
                 categories=self.settings.categories,
             )
+            histories = (
+                self.persistence.load_spend_histories(records)
+                if self.persistence is not None
+                else [None] * len(records)
+            )
+            records = [
+                record.model_copy(
+                    update={
+                        "spend_estimate": self.spend_estimator.estimate(record, history)
+                    }
+                )
+                for record, history in zip(records, histories, strict=True)
+            ]
             relevance_results = tuple(
                 self.relevance_filter.evaluate(record) for record in records
             )
@@ -423,6 +439,36 @@ def _check_sheets(settings: Settings) -> int:
     return 0
 
 
+def _estimate_spend_dry_run(settings: Settings) -> int:
+    """Estimate from PostgreSQL only; never construct or invoke a Meta provider."""
+
+    persistence = ScanPersistenceService.from_database_url(
+        settings.database_url,
+        connect_timeout_seconds=settings.database_connect_timeout_seconds,
+    )
+    try:
+        persistence.verify_connection()
+        records, histories = persistence.load_spend_dry_run_records()
+        estimator = SpendEstimator(settings)
+        estimates = []
+        for record, history in zip(records, histories, strict=True):
+            estimate = estimator.estimate(record, history)
+            estimates.append(
+                {
+                    "advertiser": record.brand.name,
+                    "estimate": format_spend_range(estimate),
+                    "source": estimate.source,
+                    "confidence": estimate.confidence,
+                    "matches_target": estimate.target_match,
+                    "observed_inputs": estimate.observed_inputs,
+                }
+            )
+    finally:
+        persistence.close()
+    print(json.dumps({"provider_called": False, "advertisers": estimates}, indent=2))
+    return 0
+
+
 def _build_meta_only_output(
     records: Sequence[AdRecord], settings: Settings
 ) -> dict[str, object]:
@@ -454,6 +500,16 @@ def _build_meta_only_output(
                     "unknown"
                     if filter_result is None
                     else "pass" if filter_result else "fail"
+                ),
+                "spend_estimate": format_spend_range(record.spend_estimate),
+                "spend_source": (
+                    record.spend_estimate.source if record.spend_estimate else "Unknown"
+                ),
+                "spend_confidence": (
+                    record.spend_estimate.confidence if record.spend_estimate else "unknown"
+                ),
+                "matches_spend_target": (
+                    record.spend_estimate.target_match if record.spend_estimate else None
                 ),
             }
         )
@@ -491,6 +547,11 @@ def main() -> int:
         action="store_true",
         help="Verify Google Sheets access, tab, headers, and Editor permission",
     )
+    commands.add_argument(
+        "--estimate-spend-dry-run",
+        action="store_true",
+        help="Estimate spend from existing PostgreSQL data without calling Apify",
+    )
     args = parser.parse_args()
 
     settings = get_settings()
@@ -500,6 +561,8 @@ def main() -> int:
             return _check_database(settings)
         if args.check_sheets:
             return _check_sheets(settings)
+        if args.estimate_spend_dry_run:
+            return _estimate_spend_dry_run(settings)
         if args.run_once:
             return asyncio.run(_run_once(settings))
         return asyncio.run(_run_meta_only(settings))

@@ -44,6 +44,22 @@ class Settings(BaseSettings):
     )
     target_min_monthly_spend_usd: float = Field(default=5_000, ge=0)
     target_max_monthly_spend_usd: float = Field(default=30_000, ge=0)
+    spend_estimation_enabled: bool = True
+    spend_target_min_usd: float = Field(default=5_000, ge=0)
+    spend_target_max_usd: float = Field(default=30_000, ge=0)
+    spend_cpm_uk_low_usd: float = Field(default=8.0, gt=0)
+    spend_cpm_uk_high_usd: float = Field(default=18.0, gt=0)
+    spend_cpm_europe_low_usd: float = Field(default=5.0, gt=0)
+    spend_cpm_europe_high_usd: float = Field(default=18.0, gt=0)
+    spend_cpm_usa_low_usd: float = Field(default=10.0, gt=0)
+    spend_cpm_usa_high_usd: float = Field(default=25.0, gt=0)
+    spend_cpm_canada_low_usd: float = Field(default=8.0, gt=0)
+    spend_cpm_canada_high_usd: float = Field(default=20.0, gt=0)
+    spend_reach_frequency_low: float = Field(default=1.0, gt=0)
+    spend_reach_frequency_high: float = Field(default=3.0, gt=0)
+    spend_activity_daily_low_usd: float = Field(default=10.0, gt=0)
+    spend_activity_daily_high_usd: float = Field(default=50.0, gt=0)
+    spend_min_observation_days: int = Field(default=7, ge=1)
     target_min_instagram_followers: int = Field(default=10_000, ge=0)
     target_max_instagram_followers: int = Field(default=100_000, ge=0)
     desirable_trustpilot_review_count: int = Field(default=300, ge=0)
@@ -91,6 +107,18 @@ class Settings(BaseSettings):
                 "APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN exceeds "
                 "APIFY_MONTHLY_BUDGET_GBP after conversion"
             )
+        pairs = (
+            ("SPEND_TARGET", self.spend_target_min_usd, self.spend_target_max_usd),
+            ("SPEND_CPM_UK", self.spend_cpm_uk_low_usd, self.spend_cpm_uk_high_usd),
+            ("SPEND_CPM_EUROPE", self.spend_cpm_europe_low_usd, self.spend_cpm_europe_high_usd),
+            ("SPEND_CPM_USA", self.spend_cpm_usa_low_usd, self.spend_cpm_usa_high_usd),
+            ("SPEND_CPM_CANADA", self.spend_cpm_canada_low_usd, self.spend_cpm_canada_high_usd),
+            ("SPEND_REACH_FREQUENCY", self.spend_reach_frequency_low, self.spend_reach_frequency_high),
+            ("SPEND_ACTIVITY_DAILY", self.spend_activity_daily_low_usd, self.spend_activity_daily_high_usd),
+        )
+        for name, low, high in pairs:
+            if low > high:
+                raise ValueError(f"{name} low value cannot exceed its high value")
         return self
 
     @property

@@ -2,8 +2,9 @@
 
 from datetime import UTC, date, datetime
 from enum import StrEnum
+from typing import Self
 
-from pydantic import BaseModel, Field, HttpUrl, JsonValue
+from pydantic import BaseModel, Field, HttpUrl, JsonValue, model_validator
 
 
 class Region(StrEnum):
@@ -84,6 +85,44 @@ class SocialStats(BaseModel):
     observed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class SpendEstimate(BaseModel):
+    """A bounded estimate with its evidence and explicit assumptions."""
+
+    low_usd: float | None = Field(default=None, ge=0)
+    high_usd: float | None = Field(default=None, ge=0)
+    method: str = Field(min_length=1, max_length=50)
+    source: str = Field(min_length=1, max_length=50)
+    confidence: str = Field(pattern=r"^(very_low|low|medium|high|unknown)$")
+    observed_inputs: dict[str, JsonValue] = Field(default_factory=dict)
+    assumptions: dict[str, JsonValue] = Field(default_factory=dict)
+    target_match: bool | None = None
+
+    @model_validator(mode="after")
+    def validate_evidence_semantics(self) -> Self:
+        expected_confidence = {
+            "impressions_cpm": "medium",
+            "reach_cpm": "low",
+            "activity_model": "very_low",
+            "unknown": "unknown",
+        }.get(self.method)
+        if expected_confidence is not None and self.confidence != expected_confidence:
+            raise ValueError(
+                f"{self.method} estimates require {expected_confidence} confidence"
+            )
+        if self.method in {"activity_model", "unknown"} and self.target_match is not None:
+            raise ValueError(
+                f"{self.method} estimates cannot make a spend-target decision"
+            )
+        return self
+
+
+class SpendHistory(BaseModel):
+    """Prior activity observations used without triggering provider calls."""
+
+    observation_count: int = Field(default=0, ge=0)
+    active_ad_counts: list[int] = Field(default_factory=list)
+
+
 class AdRecord(BaseModel):
     """Provider-normalized, advertiser-level advertising data."""
 
@@ -96,6 +135,7 @@ class AdRecord(BaseModel):
     newest_active_ad: datetime | None = None
     ads: list[MetaAdDetails] = Field(default_factory=list)
     social_stats: SocialStats | None = None
+    spend_estimate: SpendEstimate | None = None
     observed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     provider_metadata: dict[str, str | int | float | bool | None] = Field(
         default_factory=dict
@@ -132,6 +172,8 @@ class SheetCandidate(BaseModel):
     instagram_username: str | None = None
     followers: int = Field(ge=0)
     active_ads: int = Field(ge=0)
+    spend_estimate: str | None = None
+    spend_source: str | None = None
 
 
 class SheetRowState(BaseModel):

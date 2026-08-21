@@ -76,7 +76,7 @@ class MemorySheetsApi:
         for update in data:
             row_range = update["range"].split("!", 1)[1]
             row_number = int(row_range.split(":", 1)[0][1:])
-            width = 6 if ":F" in row_range else 10
+            width = 6 if ":F" in row_range else 8 if ":H" in row_range else 10
             while len(self.rows) < row_number:
                 self.rows.append([])
             existing = (self.rows[row_number - 1] + [""] * 10)[:10]
@@ -225,8 +225,8 @@ def test_full_pipeline_persists_and_writes_qualifying_advertiser(
         "@brand_page-1",
         followers,
         2,
-        "",
-        "",
+        "Unknown",
+        "Unknown",
         "",
         "",
     ]
@@ -308,7 +308,7 @@ def test_irrelevant_advertiser_is_persisted_with_reason_but_not_written(
         )
 
 
-def test_repeated_scan_updates_same_sheet_row_and_preserves_future_values(
+def test_repeated_scan_updates_same_sheet_row_and_preserves_review_values(
     session_factory: sessionmaker[Session],
 ) -> None:
     persistence = ScanPersistenceService(session_factory)
@@ -351,8 +351,8 @@ def test_repeated_scan_updates_same_sheet_row_and_preserves_future_values(
     assert sheet_api.rows[1][0] == "2026-08-01"
     assert sheet_api.rows[1][4:6] == [30_000, 3]
     assert sheet_api.rows[1][6:10] == [
-        "future spend",
-        "future source",
+        "$900–$4.5k/mo",
+        "Activity model - very rough",
         450,
         "future reviews",
     ]

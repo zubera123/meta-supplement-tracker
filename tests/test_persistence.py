@@ -27,6 +27,7 @@ from app.models import (
     Region,
     SheetRowState,
     SocialStats,
+    SpendEstimate,
 )
 
 
@@ -277,3 +278,57 @@ def test_sheet_row_mapping_is_upserted_by_stable_advertiser_identity(
         stored = session.scalar(select(GoogleSheetRow))
         assert stored is not None
         assert stored.row_number == 4
+
+
+def test_repeated_scans_store_spend_estimation_history(
+    session_factory: sessionmaker[Session],
+) -> None:
+    service = ScanPersistenceService(session_factory)
+    first = ad_record(
+        observed_at=datetime(2026, 8, 20, tzinfo=UTC), followers=20_000
+    ).model_copy(
+        update={
+            "spend_estimate": SpendEstimate(
+                low_usd=3_000,
+                high_usd=15_000,
+                method="activity_model",
+                source="Activity model - very rough",
+                confidence="very_low",
+                observed_inputs={"active_ad_count": 10},
+                assumptions={"days_per_month": 30},
+                target_match=None,
+            )
+        }
+    )
+    second = first.model_copy(
+        update={
+            "observed_at": datetime(2026, 8, 21, tzinfo=UTC),
+            "spend_estimate": first.spend_estimate.model_copy(
+                update={"low_usd": 4_000, "high_usd": 20_000}
+            ),
+        }
+    )
+
+    first_run = service.create_scan_run(["UK"])
+    service.persist_success(first_run, [first])
+    second_run = service.create_scan_run(["UK"])
+    service.persist_success(second_run, [second])
+
+    with session_factory() as session:
+        observations = session.scalars(
+            select(AdvertiserObservation).order_by(AdvertiserObservation.observed_at)
+        ).all()
+        assert [float(item.spend_estimate_low_usd) for item in observations] == [
+            3_000,
+            4_000,
+        ]
+        assert [item.spend_estimation_method for item in observations] == [
+            "activity_model",
+            "activity_model",
+        ]
+        assert all(
+            item.spend_estimation_source == "Activity model - very rough"
+            for item in observations
+        )
+        assert all(item.spend_estimation_confidence == "very_low" for item in observations)
+        assert all(item.spend_target_match is None for item in observations)

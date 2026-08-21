@@ -341,13 +341,15 @@ class GoogleSheetsProvider:
                 assigned_rows[row_number] = candidate.advertiser_id
                 existing = rows[row_number - 1]
                 visible = _visible_values(candidate, existing)
+                last_column = "H" if _has_spend_update(candidate) else "F"
+                width = 8 if last_column == "H" else 6
                 updates.append(
                     {
-                        "range": f"{_a1_tab(self._sheet_tab)}!A{row_number}:F{row_number}",
-                        "values": [visible[:6]],
+                        "range": f"{_a1_tab(self._sheet_tab)}!A{row_number}:{last_column}{row_number}",
+                        "values": [visible[:width]],
                     }
                 )
-                rows[row_number - 1] = [*visible[:6], *existing[6:10]]
+                rows[row_number - 1] = [*visible[:width], *existing[width:10]]
                 updated += 1
             else:
                 row_number = next_row
@@ -501,11 +503,15 @@ def _visible_values(
         instagram,
         candidate.followers,
         candidate.active_ads,
-        "",
-        "",
-        "",
-        "",
+        candidate.spend_estimate if candidate.spend_estimate is not None else existing[6],
+        candidate.spend_source if candidate.spend_source is not None else existing[7],
+        existing[8],
+        existing[9],
     ]
+
+
+def _has_spend_update(candidate: SheetCandidate) -> bool:
+    return candidate.spend_estimate is not None or candidate.spend_source is not None
 
 
 def _instagram(username: str | None) -> str:

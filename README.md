@@ -2,7 +2,7 @@
 
 Initial production-oriented foundation for discovering supplement brands advertising on Meta. Apify's `solidcode/meta-ads-library-scraper` Actor is the primary commercial discovery provider. Meta's official Ad Library API provider remains available as an alternative for its documented UK/EU coverage.
 
-No external-data integration is simulated. The Apify Actor supplies linked Instagram metadata where Meta exposes it, and qualifying advertisers can be synchronized to one Google Sheets tab. Reviews and defensible spend estimation remain unimplemented until verified sources are selected.
+No external-data integration is simulated. The Apify Actor supplies linked Instagram metadata where Meta exposes it, and qualifying advertisers can be synchronized to one Google Sheets tab. Reviews remain unimplemented. Spend is stored as a conservative range or `Unknown`, never as a provider-reported exact commercial spend.
 
 ## Current capabilities
 
@@ -76,6 +76,15 @@ Settings are loaded from environment variables and, for local development, `.env
 | `SUPPLEMENT_RELEVANCE_EXCLUDE_KEYWORDS` | Comma-separated obvious non-supplement signals such as produce, personal care, mineral specimens, apparel, and equipment |
 | `TARGET_MIN_MONTHLY_SPEND_USD` | `5000` |
 | `TARGET_MAX_MONTHLY_SPEND_USD` | `30000` |
+| `SPEND_ESTIMATION_ENABLED` | `true`; calculates ranges locally from observed data |
+| `SPEND_TARGET_MIN_USD` / `SPEND_TARGET_MAX_USD` | `5000` / `30000`; meaningful-overlap target |
+| `SPEND_CPM_UK_LOW_USD` / `SPEND_CPM_UK_HIGH_USD` | `8` / `18`; directional assumption |
+| `SPEND_CPM_EUROPE_LOW_USD` / `SPEND_CPM_EUROPE_HIGH_USD` | `5` / `18`; directional assumption |
+| `SPEND_CPM_USA_LOW_USD` / `SPEND_CPM_USA_HIGH_USD` | `10` / `25`; directional assumption |
+| `SPEND_CPM_CANADA_LOW_USD` / `SPEND_CPM_CANADA_HIGH_USD` | `8` / `20`; directional assumption |
+| `SPEND_REACH_FREQUENCY_LOW` / `SPEND_REACH_FREQUENCY_HIGH` | `1` / `3`; reach-to-impression assumption |
+| `SPEND_ACTIVITY_DAILY_LOW_USD` / `SPEND_ACTIVITY_DAILY_HIGH_USD` | `10` / `50`; fallback per-active-ad assumption |
+| `SPEND_MIN_OBSERVATION_DAYS` | `7`; minimum age for monthlyizing audience disclosures |
 | `TARGET_MIN_INSTAGRAM_FOLLOWERS` | `10000` |
 | `TARGET_MAX_INSTAGRAM_FOLLOWERS` | `100000` |
 | `DESIRABLE_TRUSTPILOT_REVIEW_COUNT` | `300` |
@@ -145,6 +154,29 @@ The connectivity command prints only `{"database": "reachable"}` and never print
 
 With persistence enabled, scan commands verify the database before any paid Apify Actor start. A run creates a `scan_runs` row, upserts advertisers by Meta page ID and ads by Meta ad ID, writes one advertiser observation per scan—including its relevance decision and reason—then records its counts. Provider, persistence, or output failures mark the scan failed when the database remains writable. An unavailable or missing database aborts clearly; results are never silently discarded. The JSON output includes the persisted scan-run ID.
 
+## Conservative spend estimation
+
+`SPEND_ESTIMATION_ENABLED=true` calculates a monthly range after discovery and before the observation is stored. It does not call another API and does not alter the Apify cost controls. Every observation stores the low/high bounds, method, confidence, observed inputs, assumptions, and target-overlap decision. Historical observations are retained rather than overwritten.
+
+Evidence is used in this order:
+
+1. **Finite impressions × regional CPM (medium confidence):** each ad's cumulative impressions are monthlyized as `observed impressions × 30 / active days`; the low and high totals are then `monthly impressions / 1,000 × CPM`. Open-ended disclosures such as `>1M` are not converted into a fake upper bound.
+2. **Finite reach × assumed frequency × regional CPM (low confidence):** reach is people rather than impressions, so the formula is `monthly reach × frequency / 1,000 × CPM`. Frequency defaults to a deliberately wide 1–3 range.
+3. **Activity model (very-low confidence):** when commercial ads expose no finite audience metric, the fallback is `active ads × assumed daily spend per active ad × 30`. It runs only when at least one active ad has the configured minimum longevity (seven days by default), or a prior scan supplies repeated activity evidence. Defaults are $10–$50 per active ad per day. Active-ad count and longevity are real; the dollars-per-ad factor is an explicit configurable assumption, not observed spend. Its directional range is displayed with source `Activity model - very rough`, but `spend_target_match` is always `null`: it can neither qualify nor disqualify an advertiser.
+4. **Unknown confidence:** insufficient evidence stays unknown.
+
+All numeric estimates are rounded outward to $100. Regional CPM defaults are wide directional assumptions: UK $8–$18, Europe $5–$18, USA $10–$25, and Canada $8–$20. They are based on current third-party benchmark ranges, not Meta first-party price data. Meta defines CPM as spend divided by impressions times 1,000, which justifies the inverse calculation, and separately defines reach as people and impressions as screen entries. See [Meta's CPM definition](https://www.facebook.com/help/www/214576695231407), [Meta's reach/impressions definitions](https://www.facebook.com/help/274400362581037), [SolidCode Actor output documentation](https://apify.com/solidcode/meta-ads-library-scraper), and directional 2026 country benchmarks from [Adculator](https://adculator.com/benchmarks/facebook-cpm-by-country/) and [Adligator](https://adligator.com/blog/meta-ads-cpm-by-country-benchmarks).
+
+Only genuine impressions-based and reach-based estimates may evaluate the target. For those methods, the target-match rule requires at least 50% of the estimated interval to overlap $5,000–$30,000. A zero-width estimate passes only when its value is inside the inclusive target. Boundary contact with no positive interval overlap does not pass. Activity and unknown estimates return `null`, not false. Follower-qualified rows remain in the Sheet regardless of this marker; existing rows are not deleted automatically.
+
+Preview estimates from existing PostgreSQL ads and observations without calling Apify or writing data:
+
+```bash
+python -m app.jobs.brand_scan --estimate-spend-dry-run
+```
+
+Apply migration `20260821_0004` before enabling this version in production. The relevant variables and conservative defaults are listed in `.env.example`; every low value must be no greater than its matching high value.
+
 ## Google Sheets candidate output
 
 Google Sheets output requires `PERSIST_SCAN_RESULTS=true`: PostgreSQL remains the source of stable advertiser identity, the original first-seen date, and the row mapping. The spreadsheet receives no hidden identity column, metadata tab, or second application-created tab. The complete `--run-once` command fails closed unless both persistence and Sheets output are enabled.
@@ -154,7 +186,7 @@ The configured tab contains exactly these visible columns:
 | First seen | Brand | Region | Instagram | Followers | Active ads | Spend est. | Spend source | Reviews | Review source |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 
-Only advertisers with a known Instagram follower count from 10,000 through 100,000 inclusive are written. Unknown, lower, and higher counts are excluded rather than guessed. `First seen` is the advertiser's original PostgreSQL date in `YYYY-MM-DD` format. A new advertiser receives one row with blank spend and review fields. A repeated advertiser updates columns A–F in its mapped row; columns G–J are never overwritten, preserving future spend/review values or formulas. Writes are batched, duplicate input advertisers are collapsed by PostgreSQL ID, and transient HTTP 429/5xx responses use bounded exponential retries.
+Only advertisers with a known Instagram follower count from 10,000 through 100,000 inclusive are written. Unknown, lower, and higher counts are excluded rather than guessed. `First seen` is the advertiser's original PostgreSQL date in `YYYY-MM-DD` format. Spend estimates update columns G–H while review columns I–J and all other row values remain preserved. Unknown spend is written explicitly as `Unknown`. Writes are batched, duplicate input advertisers are collapsed by PostgreSQL ID, and transient HTTP 429/5xx responses use bounded exponential retries.
 
 ### Google Cloud and spreadsheet setup
 
@@ -313,7 +345,7 @@ The implementation follows the Actor's current [input/output reference and prici
 
 Each country run sends only documented Actor input fields: `searchTerms`, `country`, `adActiveStatus="ACTIVE"`, `adType="ALL"`, `scrapeAdDetails=true`, `includeAboutPage`, `onlyTotalCount=false`, and `maxResults`. Creative-detail enrichment is enabled because it is the documented source of CTA landing URLs and snapshot URLs. `includeAboutPage` follows `APIFY_INCLUDE_ADVERTISER_DETAILS`; when enabled, the Actor documents page category, likes, verification, About text, linked Instagram username, and Instagram follower count.
 
-The provider retains documented ad IDs, page IDs and names, status, platforms, dates, body copy, Ad Library and snapshot URLs, genuine CTA landing URLs, advertiser details, and real audience fields if present. Linked Instagram username and integer follower count are normalized into `SocialStats` and the brand handle. Missing, malformed, or conflicting values remain unknown. The Actor does not currently document an Instagram profile-URL output field, so the project does not construct or guess one. Commercial spend is not estimated or inferred, so `estimated_monthly_spend_usd` remains `null`. The Actor documents spend, impressions, and several audience disclosures as political/issue-ad-only; if such a real declared range is returned it is preserved separately as `declared_spend`, but ordinary supplement searches must not be assumed to contain it.
+The provider retains documented ad IDs, page IDs and names, status, platforms, dates, body copy, Ad Library and snapshot URLs, genuine CTA landing URLs, advertiser details, and real audience fields if present. Linked Instagram username and integer follower count are normalized into `SocialStats` and the brand handle. Missing, malformed, or conflicting values remain unknown. The Actor does not currently document an Instagram profile-URL output field, so the project does not construct or guess one. Provider-reported commercial spend remains absent and `estimated_monthly_spend_usd` remains `null`; the separate estimator stores a range with evidence and assumptions. The Actor documents spend, impressions, and several audience disclosures as political/issue-ad-only; if such a real declared range is returned it is preserved separately as `declared_spend`, but ordinary supplement searches must not be assumed to contain it.
 
 The Instagram follower filter is inclusive: 10,000 and 100,000 both pass; values below or above fail; unknown remains unknown. Meta-only discovery reports the filter status but does not discard records, making missing enrichment visible. The future full pipeline can use the same filter when qualifying candidates.
 

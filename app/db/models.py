@@ -10,6 +10,7 @@ from sqlalchemy import (
     Index,
     Integer,
     JSON,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -120,6 +121,14 @@ class AdvertiserObservation(Base):
     active_ad_count: Mapped[int] = mapped_column(Integer, nullable=False)
     supplement_relevant: Mapped[bool | None] = mapped_column()
     relevance_reason: Mapped[str | None] = mapped_column(Text)
+    spend_estimate_low_usd: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    spend_estimate_high_usd: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    spend_estimation_method: Mapped[str | None] = mapped_column(String(50))
+    spend_estimation_source: Mapped[str | None] = mapped_column(String(50))
+    spend_estimation_confidence: Mapped[str | None] = mapped_column(String(10))
+    spend_estimation_inputs: Mapped[dict | None] = mapped_column(JSON)
+    spend_estimation_assumptions: Mapped[dict | None] = mapped_column(JSON)
+    spend_target_match: Mapped[bool | None] = mapped_column()
     observed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
