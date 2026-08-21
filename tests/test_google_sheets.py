@@ -361,6 +361,37 @@ def test_spend_columns_update_while_review_columns_are_preserved() -> None:
     assert api.batch_value_updates[0][0]["range"].endswith("!A2:H2")
 
 
+def test_review_columns_receive_numeric_count_and_source() -> None:
+    api = FakeSheetsApi(rows=[list(SHEET_HEADERS)])
+    reviewed = candidate().model_copy(
+        update={"review_count": 425, "review_source": "Trustpilot"}
+    )
+
+    provider(api).sync_candidates([reviewed], {})
+
+    assert api.rows[1][8:10] == [425, "Trustpilot"]
+
+
+def test_unavailable_review_preserves_existing_valid_review_values() -> None:
+    api = FakeSheetsApi(
+        rows=[
+            list(SHEET_HEADERS),
+            [
+                "2026-08-01", "Example Supplements", "UK", "@example_supplements",
+                20_000, 2, "$8k–$14k/mo", "Reach × CPM", 425, "Trustpilot",
+            ],
+        ]
+    )
+    spend_only = candidate().model_copy(
+        update={"spend_estimate": "$9k–$15k/mo", "spend_source": "Reach × CPM"}
+    )
+
+    provider(api).sync_candidates([spend_only], {1: row_state()})
+
+    assert api.rows[1][8:10] == [425, "Trustpilot"]
+    assert api.batch_value_updates[0][0]["range"].endswith("!A2:H2")
+
+
 def test_unknown_username_does_not_blank_existing_sheet_value() -> None:
     api = FakeSheetsApi(
         rows=[

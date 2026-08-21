@@ -13,7 +13,14 @@ from app.db.models import (
     ScanRun,
     utc_now,
 )
-from app.models import AdRecord, MetaAdDetails, RelevanceResult, SheetRowState
+from app.models import (
+    AdRecord,
+    MetaAdDetails,
+    RelevanceResult,
+    ReviewCache,
+    ReviewStats,
+    SheetRowState,
+)
 
 
 class ScanRepository:
@@ -86,6 +93,7 @@ class ScanRepository:
             )
             self.session.add(advertiser)
             self.session.flush()
+            self._update_review_cache(advertiser, record)
             return advertiser
 
         advertiser.page_name = record.brand.name
@@ -93,7 +101,46 @@ class ScanRepository:
             advertiser.instagram_username = username
         advertiser.latest_instagram_followers = followers
         advertiser.last_seen_at = record.observed_at
+        self._update_review_cache(advertiser, record)
         return advertiser
+
+    def review_cache(self, record: AdRecord) -> ReviewCache:
+        advertiser = self.find_advertiser(record)
+        if advertiser is None:
+            return ReviewCache()
+        latest_stats = None
+        if (
+            advertiser.trustpilot_business_unit_id
+            and advertiser.trustpilot_matched_domain
+            and advertiser.latest_trustpilot_review_count is not None
+        ):
+            trust_score = (
+                float(advertiser.latest_trustpilot_trust_score)
+                if advertiser.latest_trustpilot_trust_score is not None
+                else None
+            )
+            latest_stats = ReviewStats(
+                source="Trustpilot",
+                review_count=advertiser.latest_trustpilot_review_count,
+                rating=trust_score,
+                trust_score=trust_score,
+                star_score=(
+                    float(advertiser.latest_trustpilot_stars)
+                    if advertiser.latest_trustpilot_stars is not None
+                    else None
+                ),
+                business_unit_id=advertiser.trustpilot_business_unit_id,
+                matched_domain=advertiser.trustpilot_matched_domain,
+                observed_at=(
+                    advertiser.trustpilot_last_refreshed_at or advertiser.last_seen_at
+                ),
+            )
+        return ReviewCache(
+            business_unit_id=advertiser.trustpilot_business_unit_id,
+            matched_domain=advertiser.trustpilot_matched_domain,
+            last_refreshed_at=advertiser.trustpilot_last_refreshed_at,
+            latest_stats=latest_stats,
+        )
 
     def find_advertiser(self, record: AdRecord) -> Advertiser | None:
         page_id = record.brand.source_id
@@ -173,6 +220,8 @@ class ScanRepository:
                 ad_start_date=ad_details.ad_delivery_start_time,
                 ad_text=ad_text,
                 snapshot_url=ad_details.ad_snapshot_url,
+                landing_page_url=ad_details.landing_page_url,
+                landing_page_domain=ad_details.landing_page_domain,
                 first_seen_at=seen_at,
                 last_seen_at=seen_at,
             )
@@ -183,6 +232,8 @@ class ScanRepository:
         ad.ad_start_date = ad_details.ad_delivery_start_time
         ad.ad_text = ad_text
         ad.snapshot_url = ad_details.ad_snapshot_url
+        ad.landing_page_url = ad_details.landing_page_url
+        ad.landing_page_domain = ad_details.landing_page_domain
         ad.last_seen_at = seen_at
         return ad
 
@@ -231,10 +282,73 @@ class ScanRepository:
             spend_target_match=(
                 record.spend_estimate.target_match if record.spend_estimate else None
             ),
+            review_source=(
+                record.review_enrichment.stats.source
+                if record.review_enrichment and record.review_enrichment.stats
+                else None
+            ),
+            review_count=(
+                record.review_enrichment.stats.review_count
+                if record.review_enrichment and record.review_enrichment.stats
+                else None
+            ),
+            review_trust_score=(
+                record.review_enrichment.stats.trust_score
+                if record.review_enrichment and record.review_enrichment.stats
+                else None
+            ),
+            review_stars=(
+                record.review_enrichment.stats.star_score
+                if record.review_enrichment and record.review_enrichment.stats
+                else None
+            ),
+            review_business_unit_id=(
+                record.review_enrichment.stats.business_unit_id
+                if record.review_enrichment and record.review_enrichment.stats
+                else None
+            ),
+            review_matched_domain=(
+                record.review_enrichment.stats.matched_domain
+                if record.review_enrichment and record.review_enrichment.stats
+                else record.review_enrichment.attempted_domain
+                if record.review_enrichment
+                else None
+            ),
+            review_desirable=(
+                record.review_enrichment.stats.desirable
+                if record.review_enrichment and record.review_enrichment.stats
+                else None
+            ),
+            review_status=(
+                record.review_enrichment.status if record.review_enrichment else None
+            ),
+            review_reason=(
+                record.review_enrichment.reason if record.review_enrichment else None
+            ),
             observed_at=record.observed_at,
         )
         self.session.add(observation)
         return observation
+
+    @staticmethod
+    def _update_review_cache(advertiser: Advertiser, record: AdRecord) -> None:
+        result = record.review_enrichment
+        if result is None or result.status == "error":
+            return
+        stats = result.stats
+        if stats is not None:
+            advertiser.trustpilot_business_unit_id = stats.business_unit_id
+            advertiser.trustpilot_matched_domain = stats.matched_domain
+            advertiser.trustpilot_last_refreshed_at = result.refreshed_at
+            advertiser.latest_trustpilot_review_count = stats.review_count
+            advertiser.latest_trustpilot_trust_score = stats.trust_score
+            advertiser.latest_trustpilot_stars = stats.star_score
+            return
+        if result.refreshed_at is not None and result.attempted_domain is not None:
+            if advertiser.trustpilot_matched_domain != result.attempted_domain:
+                advertiser.trustpilot_business_unit_id = None
+            advertiser.trustpilot_matched_domain = result.attempted_domain
+            advertiser.trustpilot_last_refreshed_at = result.refreshed_at
 
     def _scan_run(self, scan_run_id: int) -> ScanRun:
         scan_run = self.session.get(ScanRun, scan_run_id)

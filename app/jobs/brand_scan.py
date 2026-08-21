@@ -6,7 +6,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TypeVar
 
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -24,6 +24,8 @@ from app.models import (
     Brand,
     BrandCandidate,
     RelevanceResult,
+    ReviewCache,
+    ReviewEnrichmentResult,
     ReviewStats,
     SocialStats,
 )
@@ -36,7 +38,12 @@ from app.services.meta_ads import (
     MetaAdLibraryProvider,
     MetaAdsProvider,
 )
-from app.services.reviews import ReviewsProvider
+from app.services.reviews import (
+    ReviewsProvider,
+    TrustpilotReviewsProvider,
+    resolve_advertiser_domain,
+    unavailable_review,
+)
 from app.services.relevance import SupplementRelevanceFilter
 from app.services.scoring import CandidateScorer
 from app.services.scoring import instagram_follower_filter
@@ -155,6 +162,7 @@ class CandidatePipeline:
         sheets: GoogleSheetsProvider | None,
         relevance_filter: SupplementRelevanceFilter | None = None,
         spend_estimator: SpendEstimator | None = None,
+        reviews: ReviewsProvider | None = None,
     ) -> None:
         if sheets is not None and persistence is None:
             raise ProviderConfigurationError(
@@ -166,6 +174,7 @@ class CandidatePipeline:
         self.sheets = sheets
         self.relevance_filter = relevance_filter or SupplementRelevanceFilter()
         self.spend_estimator = spend_estimator or SpendEstimator(settings)
+        self.reviews = reviews
 
     async def run(self) -> CandidatePipelineResult:
         """Execute once; paid Meta retrieval is intentionally invoked only once."""
@@ -207,6 +216,15 @@ class CandidatePipeline:
             relevance_results = tuple(
                 self.relevance_filter.evaluate(record) for record in records
             )
+            if self.reviews is not None:
+                if self.persistence is None:
+                    raise ProviderConfigurationError(
+                        "Review enrichment requires PostgreSQL persistence"
+                    )
+                review_caches = self.persistence.load_review_caches(records)
+                records = await self._enrich_reviews(
+                    records, review_caches, relevance_results
+                )
             for record, relevance in zip(
                 records, relevance_results, strict=True
             ):
@@ -258,10 +276,98 @@ class CandidatePipeline:
                 self.persistence.record_failure(scan_run_id, exc)
             raise
 
+    async def _enrich_reviews(
+        self,
+        records: Sequence[AdRecord],
+        caches: Sequence[ReviewCache],
+        relevance_results: Sequence[RelevanceResult] | None = None,
+    ) -> list[AdRecord]:
+        """Enrich sequentially and convert provider outages into stored soft failures."""
+
+        enriched: list[AdRecord] = []
+        refresh_cutoff = datetime.now(UTC) - timedelta(
+            hours=self.settings.trustpilot_refresh_hours
+        )
+        if relevance_results is not None and len(relevance_results) != len(records):
+            raise ValueError("Review eligibility decisions do not match records")
+        for index, (record, cache) in enumerate(zip(records, caches, strict=True)):
+            followers = (
+                record.social_stats.instagram_followers
+                if record.social_stats is not None
+                else None
+            )
+            review_eligible = (
+                relevance_results is None
+                or relevance_results[index].is_relevant
+            ) and (
+                followers is not None
+                and self.settings.target_min_instagram_followers
+                <= followers
+                <= self.settings.target_max_instagram_followers
+            )
+            if relevance_results is not None and not review_eligible:
+                result = ReviewEnrichmentResult(
+                    status="skipped",
+                    reason=(
+                        "Review lookup skipped because advertiser is not currently "
+                        "eligible for candidate output"
+                    ),
+                )
+                enriched.append(
+                    record.model_copy(update={"review_enrichment": result})
+                )
+                continue
+            domain, resolution_reason = resolve_advertiser_domain(record)
+            if domain is None:
+                result = unavailable_review(resolution_reason)
+            elif _review_cache_is_fresh(cache, domain, refresh_cutoff):
+                cached_stats = cache.latest_stats
+                if cached_stats is not None:
+                    cached_stats = cached_stats.model_copy(
+                        update={
+                            "desirable": cached_stats.review_count
+                            >= self.settings.trustpilot_min_desirable_reviews
+                        }
+                    )
+                result = ReviewEnrichmentResult(
+                    status="cached",
+                    stats=cached_stats,
+                    reason="Trustpilot cache is inside the configured refresh interval",
+                    attempted_domain=domain,
+                    refreshed_at=cache.last_refreshed_at,
+                )
+            else:
+                cached_id = (
+                    cache.business_unit_id
+                    if cache.matched_domain == domain
+                    else None
+                )
+                try:
+                    assert self.reviews is not None
+                    result = await self.reviews.get_by_domain(
+                        domain, business_unit_id=cached_id
+                    )
+                except ProviderError as exc:
+                    logger.warning(
+                        "Trustpilot review enrichment failed softly for advertiser=%s: %s",
+                        record.brand.name,
+                        exc,
+                    )
+                    result = ReviewEnrichmentResult(
+                        status="error",
+                        reason=f"Trustpilot enrichment failed: {type(exc).__name__}",
+                        attempted_domain=domain,
+                    )
+            enriched.append(
+                record.model_copy(update={"review_enrichment": result})
+            )
+        return enriched
+
 
 async def _run_scan_command(settings: Settings, *, require_full_outputs: bool) -> int:
     persistence: ScanPersistenceService | None = None
     scan_lock = None
+    reviews: ReviewsProvider | None = None
     try:
         if require_full_outputs and not settings.persist_scan_results:
             raise ProviderConfigurationError(
@@ -275,6 +381,10 @@ async def _run_scan_command(settings: Settings, *, require_full_outputs: bool) -
             raise ProviderConfigurationError(
                 "PERSIST_SCAN_RESULTS=true is required for Google Sheets output "
                 "because stable identity and First seen come from PostgreSQL"
+            )
+        if settings.reviews_enabled and not settings.persist_scan_results:
+            raise ProviderConfigurationError(
+                "PERSIST_SCAN_RESULTS=true is required for cached review enrichment"
             )
         if settings.persist_scan_results:
             persistence = ScanPersistenceService.from_database_url(
@@ -313,6 +423,7 @@ async def _run_scan_command(settings: Settings, *, require_full_outputs: bool) -
             else None
         )
         provider = _build_meta_provider(settings)
+        reviews = _build_reviews_provider(settings) if settings.reviews_enabled else None
         result = await CandidatePipeline(
             settings=settings,
             meta_ads=provider,
@@ -322,6 +433,7 @@ async def _run_scan_command(settings: Settings, *, require_full_outputs: bool) -
                 include_keywords=settings.relevance_include_keywords,
                 exclude_keywords=settings.relevance_exclude_keywords,
             ),
+            reviews=reviews,
         ).run()
         output = _build_meta_only_output(result.records, settings)
         output["persistence"] = {
@@ -352,6 +464,8 @@ async def _run_scan_command(settings: Settings, *, require_full_outputs: bool) -
         finally:
             if persistence is not None:
                 persistence.close()
+            if isinstance(reviews, TrustpilotReviewsProvider):
+                await reviews.close()
 
 
 async def _run_meta_only(settings: Settings) -> int:
@@ -423,6 +537,25 @@ def _build_sheets_provider(settings: Settings) -> GoogleSheetsProvider:
     )
 
 
+def _build_reviews_provider(settings: Settings) -> ReviewsProvider:
+    configured_provider = (settings.reviews_provider or "").casefold()
+    if configured_provider != "trustpilot":
+        raise ProviderConfigurationError(
+            "REVIEWS_PROVIDER=trustpilot is required for Trustpilot enrichment"
+        )
+    return TrustpilotReviewsProvider(
+        api_key=settings.trustpilot_api_key,
+        minimum_desirable_reviews=settings.trustpilot_min_desirable_reviews,
+        request_timeout_seconds=settings.trustpilot_request_timeout_seconds,
+        retry_attempts=settings.provider_retry_attempts,
+        retry_min_wait_seconds=settings.provider_retry_min_wait_seconds,
+        retry_max_wait_seconds=settings.provider_retry_max_wait_seconds,
+        min_request_interval_seconds=(
+            settings.trustpilot_min_request_interval_seconds
+        ),
+    )
+
+
 def _check_sheets(settings: Settings) -> int:
     provider = _build_sheets_provider(settings)
     provider.ensure_ready(verify_write_access=True)
@@ -433,6 +566,26 @@ def _check_sheets(settings: Settings) -> int:
                 "tab": settings.google_sheet_tab,
                 "headers": "ready",
                 "write_access": "verified",
+            }
+        )
+    )
+    return 0
+
+
+async def _check_reviews(settings: Settings) -> int:
+    provider = _build_reviews_provider(settings)
+    try:
+        await provider.check_connection()
+    finally:
+        if isinstance(provider, TrustpilotReviewsProvider):
+            await provider.close()
+    print(
+        json.dumps(
+            {
+                "provider": "Trustpilot",
+                "api": "reachable",
+                "authentication": "accepted",
+                "meta_provider_called": False,
             }
         )
     )
@@ -511,6 +664,21 @@ def _build_meta_only_output(
                 "matches_spend_target": (
                     record.spend_estimate.target_match if record.spend_estimate else None
                 ),
+                "reviews": (
+                    record.review_enrichment.stats.review_count
+                    if record.review_enrichment and record.review_enrichment.stats
+                    else None
+                ),
+                "review_source": (
+                    record.review_enrichment.stats.source
+                    if record.review_enrichment and record.review_enrichment.stats
+                    else None
+                ),
+                "review_status": (
+                    record.review_enrichment.status
+                    if record.review_enrichment
+                    else "disabled"
+                ),
             }
         )
     return {
@@ -522,6 +690,17 @@ def _build_meta_only_output(
         },
         "advertisers": advertisers,
     }
+
+
+def _review_cache_is_fresh(
+    cache: ReviewCache, domain: str, refresh_cutoff: datetime
+) -> bool:
+    if cache.matched_domain != domain or cache.last_refreshed_at is None:
+        return False
+    refreshed_at = cache.last_refreshed_at
+    if refreshed_at.tzinfo is None:
+        refreshed_at = refreshed_at.replace(tzinfo=UTC)
+    return refreshed_at >= refresh_cutoff
 
 
 def main() -> int:
@@ -552,6 +731,11 @@ def main() -> int:
         action="store_true",
         help="Estimate spend from existing PostgreSQL data without calling Apify",
     )
+    commands.add_argument(
+        "--check-reviews",
+        action="store_true",
+        help="Verify Trustpilot API configuration without calling Meta or Apify",
+    )
     args = parser.parse_args()
 
     settings = get_settings()
@@ -563,6 +747,8 @@ def main() -> int:
             return _check_sheets(settings)
         if args.estimate_spend_dry_run:
             return _estimate_spend_dry_run(settings)
+        if args.check_reviews:
+            return asyncio.run(_check_reviews(settings))
         if args.run_once:
             return asyncio.run(_run_once(settings))
         return asyncio.run(_run_meta_only(settings))

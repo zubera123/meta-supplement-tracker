@@ -25,6 +25,8 @@ from app.models import (
     Brand,
     MetaAdDetails,
     Region,
+    ReviewEnrichmentResult,
+    ReviewStats,
     SheetRowState,
     SocialStats,
     SpendEstimate,
@@ -72,6 +74,8 @@ def ad_record(
                 page_name="Example Supplements",
                 ad_delivery_start_time=observed_at - timedelta(days=7),
                 ad_snapshot_url="https://www.facebook.com/ads/library/?id=ad-1",
+                landing_page_url="https://example.com/products/magnesium",
+                landing_page_domain="example.com",
                 creative_bodies=[ad_text],
                 matched_regions=[Region.UK],
             )
@@ -141,6 +145,7 @@ def test_repeated_scans_deduplicate_and_record_follower_history(
         stored_ad = session.scalar(select(Ad))
         assert stored_ad is not None
         assert stored_ad.ad_text == "Updated magnesium gummies"
+        assert stored_ad.landing_page_domain == "example.com"
         observations = session.scalars(
             select(AdvertiserObservation).order_by(AdvertiserObservation.observed_at)
         ).all()
@@ -332,3 +337,48 @@ def test_repeated_scans_store_spend_estimation_history(
         )
         assert all(item.spend_estimation_confidence == "very_low" for item in observations)
         assert all(item.spend_target_match is None for item in observations)
+
+
+def test_review_history_and_business_unit_cache_are_persisted(
+    session_factory: sessionmaker[Session],
+) -> None:
+    service = ScanPersistenceService(session_factory)
+    observed_at = datetime(2026, 8, 21, tzinfo=UTC)
+    stats = ReviewStats(
+        source="Trustpilot",
+        review_count=425,
+        trust_score=4.6,
+        star_score=4.5,
+        business_unit_id="business-unit-1",
+        matched_domain="example.com",
+        desirable=True,
+        observed_at=observed_at,
+    )
+    record = ad_record(observed_at=observed_at, followers=20_000).model_copy(
+        update={
+            "review_enrichment": ReviewEnrichmentResult(
+                status="matched",
+                stats=stats,
+                reason="matched",
+                attempted_domain="example.com",
+                refreshed_at=observed_at,
+            )
+        }
+    )
+
+    scan_run_id = service.create_scan_run(["UK"])
+    service.persist_success(scan_run_id, [record])
+    caches = service.load_review_caches([record])
+
+    assert caches[0].business_unit_id == "business-unit-1"
+    assert caches[0].matched_domain == "example.com"
+    assert caches[0].latest_stats is not None
+    assert caches[0].latest_stats.review_count == 425
+    with session_factory() as session:
+        observation = session.scalar(select(AdvertiserObservation))
+        assert observation is not None
+        assert observation.review_source == "Trustpilot"
+        assert observation.review_count == 425
+        assert float(observation.review_trust_score) == 4.6
+        assert float(observation.review_stars) == 4.5
+        assert observation.review_desirable is True

@@ -136,6 +136,7 @@ class AdRecord(BaseModel):
     ads: list[MetaAdDetails] = Field(default_factory=list)
     social_stats: SocialStats | None = None
     spend_estimate: SpendEstimate | None = None
+    review_enrichment: "ReviewEnrichmentResult | None" = None
     observed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     provider_metadata: dict[str, str | int | float | bool | None] = Field(
         default_factory=dict
@@ -147,7 +148,33 @@ class ReviewStats(BaseModel):
     source: str = Field(min_length=1)
     review_count: int = Field(ge=0)
     rating: float | None = Field(default=None, ge=0, le=5)
+    trust_score: float | None = Field(default=None, ge=0, le=5)
+    star_score: float | None = Field(default=None, ge=0, le=5)
+    business_unit_id: str | None = None
+    matched_domain: str | None = None
+    desirable: bool | None = None
     observed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class ReviewEnrichmentResult(BaseModel):
+    """Review lookup outcome, including unknown/error reasons for persistence."""
+
+    status: str = Field(
+        pattern=r"^(matched|cached|unavailable|error|skipped|disabled)$"
+    )
+    stats: ReviewStats | None = None
+    reason: str = Field(min_length=1, max_length=2000)
+    attempted_domain: str | None = None
+    refreshed_at: datetime | None = None
+
+
+class ReviewCache(BaseModel):
+    """Persisted Trustpilot identity and latest values for refresh decisions."""
+
+    business_unit_id: str | None = None
+    matched_domain: str | None = None
+    last_refreshed_at: datetime | None = None
+    latest_stats: ReviewStats | None = None
 
 
 class BrandCandidate(BaseModel):
@@ -174,6 +201,8 @@ class SheetCandidate(BaseModel):
     active_ads: int = Field(ge=0)
     spend_estimate: str | None = None
     spend_source: str | None = None
+    review_count: int | None = Field(default=None, ge=0)
+    review_source: str | None = None
 
 
 class SheetRowState(BaseModel):

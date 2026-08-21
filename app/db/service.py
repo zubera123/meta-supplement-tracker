@@ -21,6 +21,7 @@ from app.models import (
     MetaAdDetails,
     Region,
     RelevanceResult,
+    ReviewCache,
     SheetCandidate,
     SheetRowState,
     SpendHistory,
@@ -197,6 +198,18 @@ class ScanPersistenceService:
                                 if record.spend_estimate is not None
                                 else "Unknown"
                             ),
+                            review_count=(
+                                record.review_enrichment.stats.review_count
+                                if record.review_enrichment
+                                and record.review_enrichment.stats
+                                else None
+                            ),
+                            review_source=(
+                                record.review_enrichment.stats.source
+                                if record.review_enrichment
+                                and record.review_enrichment.stats
+                                else None
+                            ),
                         )
                     )
                 states = repository.sheet_row_states(
@@ -206,6 +219,18 @@ class ScanPersistenceService:
         except SQLAlchemyError as exc:
             raise DatabasePersistenceError(
                 "Could not prepare candidates for Google Sheets"
+            ) from exc
+
+    def load_review_caches(self, records: Sequence[AdRecord]) -> list[ReviewCache]:
+        """Load persisted Trustpilot IDs and refresh timestamps in record order."""
+
+        try:
+            with self._session_factory() as session:
+                repository = ScanRepository(session)
+                return [repository.review_cache(record) for record in records]
+        except SQLAlchemyError as exc:
+            raise DatabasePersistenceError(
+                "Could not load Trustpilot review cache"
             ) from exc
 
     def load_spend_histories(
@@ -291,6 +316,8 @@ class ScanPersistenceService:
                                     page_name=advertiser.page_name,
                                     ad_delivery_start_time=ad.ad_start_date,
                                     ad_snapshot_url=ad.snapshot_url,
+                                    landing_page_url=ad.landing_page_url,
+                                    landing_page_domain=ad.landing_page_domain,
                                     creative_bodies=[ad.ad_text] if ad.ad_text else [],
                                 )
                                 for ad in ads

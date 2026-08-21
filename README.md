@@ -2,7 +2,7 @@
 
 Initial production-oriented foundation for discovering supplement brands advertising on Meta. Apify's `solidcode/meta-ads-library-scraper` Actor is the primary commercial discovery provider. Meta's official Ad Library API provider remains available as an alternative for its documented UK/EU coverage.
 
-No external-data integration is simulated. The Apify Actor supplies linked Instagram metadata where Meta exposes it, and qualifying advertisers can be synchronized to one Google Sheets tab. Reviews remain unimplemented. Spend is stored as a conservative range or `Unknown`, never as a provider-reported exact commercial spend.
+No external-data integration is simulated. The Apify Actor supplies linked Instagram metadata where Meta exposes it, qualifying advertisers can be synchronized to one Google Sheets tab, and optional Trustpilot public Business Unit data can enrich candidates that have a genuine destination domain. Spend is stored as a conservative range or `Unknown`, never as a provider-reported exact commercial spend.
 
 ## Current capabilities
 
@@ -87,7 +87,7 @@ Settings are loaded from environment variables and, for local development, `.env
 | `SPEND_MIN_OBSERVATION_DAYS` | `7`; minimum age for monthlyizing audience disclosures |
 | `TARGET_MIN_INSTAGRAM_FOLLOWERS` | `10000` |
 | `TARGET_MAX_INSTAGRAM_FOLLOWERS` | `100000` |
-| `DESIRABLE_TRUSTPILOT_REVIEW_COUNT` | `300` |
+| `DESIRABLE_TRUSTPILOT_REVIEW_COUNT` | `300`; legacy scorer setting |
 | `SCAN_INTERVAL_HOURS` | `12`; descriptive application setting—the Railway Cron expression controls production timing |
 | `PROVIDER_RETRY_ATTEMPTS` | `3` |
 | `DATABASE_URL` | Required only when persistence is enabled; reference Railway PostgreSQL's `DATABASE_URL` |
@@ -107,7 +107,14 @@ Settings are loaded from environment variables and, for local development, `.env
 | `APIFY_BUDGET_GBP_PER_USD` | `1.0`; conservative conversion applied to Apify's USD usage figures |
 | `APIFY_REQUEST_TIMEOUT_SECONDS` | `120`; overall wait limit for each Actor run |
 | `INSTAGRAM_PROVIDER`, `INSTAGRAM_API_KEY` | Instagram provider placeholders |
-| `REVIEWS_PROVIDER`, `REVIEWS_API_KEY` | Reviews provider placeholders |
+| `REVIEWS_ENABLED` | `false`; enables optional candidate review enrichment |
+| `REVIEWS_PROVIDER` | Set to `trustpilot` when review enrichment is enabled |
+| `TRUSTPILOT_API_KEY` | Trustpilot API-module key; secret, never log or commit it |
+| `TRUSTPILOT_MIN_DESIRABLE_REVIEWS` | `300`; positive signal only, never a rejection rule |
+| `TRUSTPILOT_REFRESH_HOURS` | `24`; Trustpilot's display cache-refresh requirement |
+| `TRUSTPILOT_REQUEST_TIMEOUT_SECONDS` | `30` |
+| `TRUSTPILOT_MIN_REQUEST_INTERVAL_SECONDS` | `0.4`; keeps request throughput below documented limits |
+| `REVIEWS_API_KEY` | Reserved legacy placeholder; not used by Trustpilot |
 | `GOOGLE_SHEETS_ENABLED` | `false`; enable candidate synchronization after PostgreSQL and Sheets are configured |
 | `GOOGLE_SHEET_ID` | Target spreadsheet ID; the supplied example points to the intended workbook |
 | `GOOGLE_SHEET_TAB` | `Candidates`; created when absent if the service account has Editor access |
@@ -177,6 +184,43 @@ python -m app.jobs.brand_scan --estimate-spend-dry-run
 
 Apply migration `20260821_0004` before enabling this version in production. The relevant variables and conservative defaults are listed in `.env.example`; every low value must be no greater than its matching high value.
 
+## Optional Trustpilot review enrichment
+
+Set `REVIEWS_ENABLED=true` and `REVIEWS_PROVIDER=trustpilot` to enrich follower- and relevance-qualified candidates through Trustpilot's public Business Units API. Review data never controls candidate qualification. At least 300 reviews sets an internal desirable flag; lower counts remain valid and unknown data receives no penalty.
+
+The implementation uses only Trustpilot's documented public endpoints:
+
+- `GET https://api.trustpilot.com/v1/business-units/find?name={base-domain}` resolves a Business Unit by domain.
+- `GET https://api.trustpilot.com/v1/business-units/{businessUnitId}` refreshes a cached match without resolving it again.
+- Authentication is the `apikey` request header.
+- The documented response fields normalized are `id`, `name.identifying`/`name.referring`, `numberOfReviews.total`, `score.trustScore`, and `score.stars`.
+
+The source is always `Trustpilot`. PostgreSQL retains real landing-page URLs/domains, caches the matched Business Unit ID and domain, latest count/scores, and last successful resolution/refresh time. Every scan observation records its review status, values, desirable flag, match identity, and reason. A fresh cache suppresses API calls. Trustpilot says Business Unit IDs normally do not change and advises storing them instead of resolving each time. Because the Sheet displays the values, the default refresh interval is 24 hours rather than seven days, following Trustpilot's Content Refresh Guidelines.
+
+Domain resolution never derives a website from the advertiser name. It accepts only the existing `Brand.website`, Apify `ctaDomain` normalized as `landing_page_domain`, or the hostname of a genuine `ctaUrl` when no documented domain is present. Multiple conflicting domains, missing destinations, IP addresses, and Meta/Instagram destinations remain unknown with a persisted reason. The current SolidCode Actor documents and can return `ctaDomain`/`ctaUrl` when ad-detail scraping is enabled, but individual commercial results may omit both, so Trustpilot coverage is necessarily partial.
+
+HTTP 429 and transient 5xx/network failures use bounded retries. A numeric `Retry-After` is honored when it fits inside the configured scan retry window; a longer rate-limit wait fails softly and is deferred to a later scheduled run. Trustpilot currently recommends no more than 833 calls per five minutes or 10,000 calls/hour. Requests are serialized and spaced by at least 0.4 seconds by default, capping steady throughput at 750 calls per five minutes and 9,000 calls/hour before network latency. Persistent ID reuse and the 24-hour refresh gate reduce it further. Trustpilot outages and malformed responses are logged without credentials and stored as an error outcome; they do not cancel the paid Meta result, PostgreSQL persistence, or Sheet sync. Existing valid review cells are preserved if a later lookup is unavailable.
+
+Trustpilot requires a Trustpilot for Business account with access to its API module. Configure these variables in both the Railway web and Cron services, preferably through shared/reference variables:
+
+```env
+REVIEWS_ENABLED=true
+REVIEWS_PROVIDER=trustpilot
+TRUSTPILOT_API_KEY=
+TRUSTPILOT_MIN_DESIRABLE_REVIEWS=300
+TRUSTPILOT_REFRESH_HOURS=24
+TRUSTPILOT_REQUEST_TIMEOUT_SECONDS=30
+TRUSTPILOT_MIN_REQUEST_INTERVAL_SECONDS=0.4
+```
+
+Verify API-key acceptance without starting Meta discovery or Apify:
+
+```bash
+python -m app.jobs.brand_scan --check-reviews
+```
+
+The check resolves Trustpilot's own documented domain and prints only provider/connectivity status. Apply migration `20260821_0005` before enabling enrichment.
+
 ## Google Sheets candidate output
 
 Google Sheets output requires `PERSIST_SCAN_RESULTS=true`: PostgreSQL remains the source of stable advertiser identity, the original first-seen date, and the row mapping. The spreadsheet receives no hidden identity column, metadata tab, or second application-created tab. The complete `--run-once` command fails closed unless both persistence and Sheets output are enabled.
@@ -186,7 +230,7 @@ The configured tab contains exactly these visible columns:
 | First seen | Brand | Region | Instagram | Followers | Active ads | Spend est. | Spend source | Reviews | Review source |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 
-Only advertisers with a known Instagram follower count from 10,000 through 100,000 inclusive are written. Unknown, lower, and higher counts are excluded rather than guessed. `First seen` is the advertiser's original PostgreSQL date in `YYYY-MM-DD` format. Spend estimates update columns G–H while review columns I–J and all other row values remain preserved. Unknown spend is written explicitly as `Unknown`. Writes are batched, duplicate input advertisers are collapsed by PostgreSQL ID, and transient HTTP 429/5xx responses use bounded exponential retries.
+Only advertisers with a known Instagram follower count from 10,000 through 100,000 inclusive are written. Unknown, lower, and higher counts are excluded rather than guessed. `First seen` is the advertiser's original PostgreSQL date in `YYYY-MM-DD` format. Spend estimates update columns G–H. A successful Trustpilot match writes its numeric count and `Trustpilot` to I–J. Missing or failed review enrichment leaves those cells unchanged, preserving an earlier valid value. No visible columns are added. Unknown spend is written explicitly as `Unknown`. Writes are batched, duplicate input advertisers are collapsed by PostgreSQL ID, and transient HTTP 429/5xx responses use bounded exponential retries.
 
 ### Google Cloud and spreadsheet setup
 
@@ -231,7 +275,7 @@ After PostgreSQL, Apify, and Google Sheets are configured, run:
 python -m app.jobs.brand_scan --run-once
 ```
 
-This command performs exactly one discovery run: Apify aggregates and deduplicates ads by advertiser, the deterministic supplement relevance filter evaluates real provider-returned text, all returned advertisers/ads/observations and relevance reasons are persisted, known Instagram follower counts are filtered inclusively from 10,000 through 100,000, and qualifying relevant advertisers are synchronized to their PostgreSQL-mapped Sheet rows. Irrelevant, unknown-follower, and out-of-range advertisers remain in PostgreSQL but are not written to the Sheet. Spend and review cells remain blank for new rows, while repeat updates touch only columns A–F and preserve existing values in G–J.
+This command performs exactly one discovery run: Apify aggregates and deduplicates ads by advertiser, the deterministic supplement relevance filter evaluates real provider-returned text, all returned advertisers/ads/observations and relevance reasons are persisted, known Instagram follower counts are filtered inclusively from 10,000 through 100,000, and qualifying relevant advertisers are synchronized to their PostgreSQL-mapped Sheet rows. Optional Trustpilot enrichment runs only for current candidate-output advertisers and never changes qualification. Irrelevant, unknown-follower, and out-of-range advertisers remain in PostgreSQL but are not written to the Sheet.
 
 Database and Sheets connectivity are checked before paid discovery. The pipeline invokes the Meta provider once; Apify's paid Actor start retains its no-automatic-retry behavior, while the existing monthly budget and `maxTotalChargeUsd` guards remain active. Any persistence or Sheets failure is surfaced and the scan run is marked failed when PostgreSQL remains writable.
 
@@ -277,6 +321,7 @@ The expression runs every day at **00:00 UTC** and **12:00 UTC**. Railway evalua
    - `META_AD_PROVIDER`, `APIFY_API_TOKEN`, `APIFY_ACTOR_ID`, `APIFY_MAX_RESULTS_PER_QUERY`
    - `APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN`, `APIFY_INCLUDE_ADVERTISER_DETAILS`, `APIFY_MONTHLY_BUDGET_GBP`, `APIFY_BUDGET_GBP_PER_USD`, `APIFY_REQUEST_TIMEOUT_SECONDS`
    - `GOOGLE_SHEETS_ENABLED`, `GOOGLE_SHEET_ID`, `GOOGLE_SHEET_TAB`, `GOOGLE_SERVICE_ACCOUNT_JSON`
+   - `REVIEWS_ENABLED`, `REVIEWS_PROVIDER`, `TRUSTPILOT_API_KEY`, `TRUSTPILOT_MIN_DESIRABLE_REVIEWS`, `TRUSTPILOT_REFRESH_HOURS`, `TRUSTPILOT_REQUEST_TIMEOUT_SECONDS`, `TRUSTPILOT_MIN_REQUEST_INTERVAL_SECONDS`
 
    The production values must still make `PERSIST_SCAN_RESULTS=true` and `GOOGLE_SHEETS_ENABLED=true`; `--run-once` fails closed otherwise. Do not give the Cron service a public domain.
 6. Review Railway's staged service and variable changes, then deploy the Cron service. No paid scan runs at deploy time; the command runs only at the next scheduled execution or an explicitly requested manual execution.
@@ -522,11 +567,11 @@ After the private GitHub repository has been pushed:
 
 No Railway deployment is performed by this project setup.
 
-## Unimplemented integrations
+## Current limitations
 
-- Defensible commercial Meta spend estimation; the official Ad Library API does not return commercial spend
 - EU countries absent from the current SolidCode Actor country schema
 - Instagram profile URL, because the current Actor does not document one
-- Trustpilot or other reviews enrichment; the corresponding Sheet columns intentionally remain blank
+- Trustpilot matching is unavailable when Apify omits a reliable CTA destination domain or returns conflicting domains
+- Trustpilot access requires a Business account with the API module; this project does not scrape public profile pages
 
 Each is intentionally left behind an interface rather than returning fabricated data. Provider choice must be validated against official documentation, access requirements, terms, and available fields before implementation.

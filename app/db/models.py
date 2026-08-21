@@ -63,6 +63,14 @@ class Advertiser(Base):
     page_name: Mapped[str] = mapped_column(String(500), nullable=False)
     instagram_username: Mapped[str | None] = mapped_column(String(255))
     latest_instagram_followers: Mapped[int | None] = mapped_column(Integer)
+    trustpilot_business_unit_id: Mapped[str | None] = mapped_column(String(255))
+    trustpilot_matched_domain: Mapped[str | None] = mapped_column(String(500))
+    trustpilot_last_refreshed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    latest_trustpilot_review_count: Mapped[int | None] = mapped_column(Integer)
+    latest_trustpilot_trust_score: Mapped[float | None] = mapped_column(Numeric(3, 2))
+    latest_trustpilot_stars: Mapped[float | None] = mapped_column(Numeric(2, 1))
     first_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -93,6 +101,8 @@ class Ad(Base):
     ad_start_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ad_text: Mapped[str | None] = mapped_column(Text)
     snapshot_url: Mapped[str | None] = mapped_column(Text)
+    landing_page_url: Mapped[str | None] = mapped_column(Text)
+    landing_page_domain: Mapped[str | None] = mapped_column(String(500))
     first_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -129,6 +139,15 @@ class AdvertiserObservation(Base):
     spend_estimation_inputs: Mapped[dict | None] = mapped_column(JSON)
     spend_estimation_assumptions: Mapped[dict | None] = mapped_column(JSON)
     spend_target_match: Mapped[bool | None] = mapped_column()
+    review_source: Mapped[str | None] = mapped_column(String(50))
+    review_count: Mapped[int | None] = mapped_column(Integer)
+    review_trust_score: Mapped[float | None] = mapped_column(Numeric(3, 2))
+    review_stars: Mapped[float | None] = mapped_column(Numeric(2, 1))
+    review_business_unit_id: Mapped[str | None] = mapped_column(String(255))
+    review_matched_domain: Mapped[str | None] = mapped_column(String(500))
+    review_desirable: Mapped[bool | None] = mapped_column()
+    review_status: Mapped[str | None] = mapped_column(String(20))
+    review_reason: Mapped[str | None] = mapped_column(Text)
     observed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
