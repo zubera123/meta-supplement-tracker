@@ -89,6 +89,7 @@ Settings are loaded from environment variables and, for local development, `.env
 | `TARGET_MAX_INSTAGRAM_FOLLOWERS` | `100000` |
 | `DESIRABLE_TRUSTPILOT_REVIEW_COUNT` | `300`; legacy scorer setting |
 | `SCAN_INTERVAL_HOURS` | `12`; descriptive application setting—the Railway Cron expression controls production timing |
+| `SCAN_MAX_RUNTIME_SECONDS` | `2700`; 45-minute deadline for the complete `--run-once` pipeline |
 | `PROVIDER_RETRY_ATTEMPTS` | `3` |
 | `DATABASE_URL` | Required only when persistence is enabled; reference Railway PostgreSQL's `DATABASE_URL` |
 | `PERSIST_SCAN_RESULTS` | `false`; must be `true` for the complete `--run-once` pipeline |
@@ -100,8 +101,9 @@ Settings are loaded from environment variables and, for local development, `.env
 | `META_MAX_PAGES_PER_QUERY` | `100`; local safety ceiling, not a Meta rate limit |
 | `APIFY_API_TOKEN` | Required when `META_AD_PROVIDER=apify` or `REVIEWS_PROVIDER=apify_trustpilot`; keep it in Railway or local `.env` only |
 | `APIFY_ACTOR_ID` | `solidcode/meta-ads-library-scraper` |
-| `APIFY_MAX_RESULTS_PER_QUERY` | `500`; maximum results for each country Actor run, shared across all search terms |
-| `APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN` | `0.02`; server-side ceiling for each Actor run |
+| `APIFY_META_ACTOR_BUILD` | `1.0.7`; exact known-good Actor build number sent through Apify's documented `build` run option |
+| `APIFY_MAX_RESULTS_PER_QUERY` | `15`; maximum enriched results for each country Actor run, shared across all search terms |
+| `APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN` | `0.019`; server-side ceiling for each Actor run |
 | `APIFY_INCLUDE_ADVERTISER_DETAILS` | `true`; enables documented page and linked Instagram enrichment |
 | `APIFY_MONTHLY_BUDGET_GBP` | `30`; aborts before starting paid runs when projected monthly usage exceeds this guard |
 | `APIFY_BUDGET_GBP_PER_USD` | `1.0`; conservative conversion applied to Apify's USD usage figures |
@@ -151,15 +153,14 @@ alembic upgrade head
 python -m app.jobs.brand_scan --check-db
 ```
 
-After this code is deployed and the Railway reference variable exists, apply and verify the migration inside the application container:
+The authoritative web deployment runs `alembic upgrade head` through Railway's `preDeployCommand`. Railway executes it in a separate container with production variables and private-network access; a non-zero migration exit blocks the new web deployment. The Cron config deliberately has no pre-deploy command, avoiding concurrent Alembic runs against the same database. After deployment, verify the revision without reapplying it:
 
 ```bash
-railway ssh -- alembic upgrade head
 railway ssh -- alembic current
 railway ssh -- python -m app.jobs.brand_scan --check-db
 ```
 
-The connectivity command prints only `{"database": "reachable"}` and never prints the connection URL. Migrations are intentionally explicit rather than being run during every web-service startup.
+The connectivity command prints only `{"database": "reachable"}` and never prints the connection URL. See Railway's [pre-deploy command documentation](https://docs.railway.com/deployments/pre-deploy-command); this is intentionally a deployment step, not a web-process startup step.
 
 With persistence enabled, scan commands verify the database before any paid Apify Actor start. A run creates a `scan_runs` row, upserts advertisers by Meta page ID and ads by Meta ad ID, writes one advertiser observation per scan—including its relevance decision and reason—then records its counts. Provider, persistence, or output failures mark the scan failed when the database remains writable. An unavailable or missing database aborts clearly; results are never silently discarded. The JSON output includes the persisted scan-run ID.
 
@@ -176,7 +177,7 @@ Evidence is used in this order:
 
 All numeric estimates are rounded outward to $100. Regional CPM defaults are wide directional assumptions: UK $8–$18, Europe $5–$18, USA $10–$25, and Canada $8–$20. They are based on current third-party benchmark ranges, not Meta first-party price data. Meta defines CPM as spend divided by impressions times 1,000, which justifies the inverse calculation, and separately defines reach as people and impressions as screen entries. See [Meta's CPM definition](https://www.facebook.com/help/www/214576695231407), [Meta's reach/impressions definitions](https://www.facebook.com/help/274400362581037), [SolidCode Actor output documentation](https://apify.com/solidcode/meta-ads-library-scraper), and directional 2026 country benchmarks from [Adculator](https://adculator.com/benchmarks/facebook-cpm-by-country/) and [Adligator](https://adligator.com/blog/meta-ads-cpm-by-country-benchmarks).
 
-Only genuine impressions-based and reach-based estimates may evaluate the target. For those methods, the target-match rule requires at least 50% of the estimated interval to overlap $5,000–$30,000. A zero-width estimate passes only when its value is inside the inclusive target. Boundary contact with no positive interval overlap does not pass. Activity and unknown estimates return `null`, not false. Follower-qualified rows remain in the Sheet regardless of this marker; existing rows are not deleted automatically.
+Only genuine impressions-based and reach-based estimates may evaluate the target. For those methods, the target-match rule requires at least 50% of the estimated interval to overlap $5,000–$30,000. A zero-width estimate passes only when its value is inside the inclusive target. Boundary contact with no positive interval overlap does not pass. A reliable `spend_target_match=false` prevents a current Sheet write/update, while `true` remains eligible. Activity and unknown estimates return `null` and remain eligible for now; they cannot qualify or disqualify a candidate. Every advertiser and estimate is still persisted, and existing Sheet rows are not retroactively deleted.
 
 Preview estimates from existing PostgreSQL ads and observations without calling Apify or writing data:
 
@@ -309,17 +310,17 @@ After PostgreSQL, Apify, and Google Sheets are configured, run:
 python -m app.jobs.brand_scan --run-once
 ```
 
-This command performs exactly one discovery run: Apify aggregates and deduplicates ads by advertiser, the deterministic supplement relevance filter evaluates real provider-returned text, all returned advertisers/ads/observations and relevance reasons are persisted, known Instagram follower counts are filtered inclusively from 10,000 through 100,000, and qualifying relevant advertisers are synchronized to their PostgreSQL-mapped Sheet rows. Optional Trustpilot enrichment runs only for current candidate-output advertisers and never changes qualification. Irrelevant, unknown-follower, and out-of-range advertisers remain in PostgreSQL but are not written to the Sheet.
+This command performs exactly one discovery run: Apify aggregates and deduplicates ads by advertiser, the deterministic supplement relevance filter evaluates real provider-returned text, all returned advertisers/ads/observations and relevance reasons are persisted, known Instagram follower counts are filtered inclusively from 10,000 through 100,000, and qualifying relevant advertisers are synchronized to their PostgreSQL-mapped Sheet rows. Reliable impressions/reach estimates outside the spend target suppress the current Sheet write; activity/unknown spend remains eligible. Optional Trustpilot enrichment runs only for current candidate-output advertisers and never changes qualification. Irrelevant, unknown-follower, out-of-range, and reliable spend-disqualified advertisers remain in PostgreSQL.
 
-Database and Sheets connectivity are checked before paid discovery. The pipeline invokes the Meta provider once; Apify's paid Actor start retains its no-automatic-retry behavior, while the existing monthly budget and `maxTotalChargeUsd` guards remain active. Any persistence or Sheets failure is surfaced and the scan run is marked failed when PostgreSQL remains writable.
+Database and Sheets connectivity are checked before paid discovery. The pipeline invokes the Meta provider once; Apify's paid Actor start retains its no-automatic-retry behavior, while the existing monthly budget and `maxTotalChargeUsd` guards remain active. `SCAN_MAX_RUNTIME_SECONDS=2700` bounds the complete `--run-once` lifecycle. On expiry the current Actor is aborted when one has started, the scan is marked failed when its row exists, resources and the advisory lock are released, and the process exits non-zero.
 
-For a future safe production validation, use this exact UK-only, 20-result command after reviewing the current Actor pricing and account usage:
+For a future safe production validation, use this exact UK-only, 15-result command after reviewing the current Actor pricing and account usage:
 
 ```bash
-railway ssh -- env SCAN_REGIONS=UK APIFY_MAX_RESULTS_PER_QUERY=20 APIFY_INCLUDE_ADVERTISER_DETAILS=true APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN=0.03 python -m app.jobs.brand_scan --run-once
+railway ssh -- env SCAN_REGIONS=UK APIFY_MAX_RESULTS_PER_QUERY=15 APIFY_INCLUDE_ADVERTISER_DETAILS=true APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN=0.019 python -m app.jobs.brand_scan --run-once
 ```
 
-The command performs one country run with at most 20 enriched results and a server-side `$0.03` run ceiling. Do not run it until a paid live validation is explicitly approved. `--meta-only` remains available for discovery diagnostics and uses persistence or Sheets only when their respective flags are enabled.
+The command performs one country run with at most 15 enriched results and a server-side `$0.019` run ceiling. Current event pricing projects `$0.0185`. Do not run it until a paid live validation is explicitly approved. `--meta-only` remains available for discovery diagnostics and uses persistence or Sheets only when their respective flags are enabled.
 
 ## Automated production scans on Railway
 
@@ -347,12 +348,12 @@ The expression runs every day at **00:00 UTC** and **12:00 UTC**. Railway evalua
 4. In **Settings → Cron Schedule**, enter `0 0,12 * * *`.
 5. In **Variables**, use **Add Reference Variable** to reference the existing production app service's values. Reference variables are documented by Railway and avoid copying secrets. The Cron service needs the same values for:
 
-   - `APP_ENV`, `LOG_LEVEL`, `SCAN_REGIONS`, `SUPPLEMENT_CATEGORIES`
+   - `APP_ENV`, `LOG_LEVEL`, `SCAN_REGIONS`, `SCAN_MAX_RUNTIME_SECONDS`, `SUPPLEMENT_CATEGORIES`
    - `SUPPLEMENT_RELEVANCE_INCLUDE_KEYWORDS`, `SUPPLEMENT_RELEVANCE_EXCLUDE_KEYWORDS`
    - `TARGET_MIN_INSTAGRAM_FOLLOWERS`, `TARGET_MAX_INSTAGRAM_FOLLOWERS`
    - `PROVIDER_RETRY_ATTEMPTS`, `PROVIDER_RETRY_MIN_WAIT_SECONDS`, `PROVIDER_RETRY_MAX_WAIT_SECONDS`
    - `DATABASE_URL`, `PERSIST_SCAN_RESULTS`, `DATABASE_CONNECT_TIMEOUT_SECONDS`
-   - `META_AD_PROVIDER`, `APIFY_API_TOKEN`, `APIFY_ACTOR_ID`, `APIFY_MAX_RESULTS_PER_QUERY`
+   - `META_AD_PROVIDER`, `APIFY_API_TOKEN`, `APIFY_ACTOR_ID`, `APIFY_META_ACTOR_BUILD`, `APIFY_MAX_RESULTS_PER_QUERY`
    - `APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN`, `APIFY_INCLUDE_ADVERTISER_DETAILS`, `APIFY_MONTHLY_BUDGET_GBP`, `APIFY_BUDGET_GBP_PER_USD`, `APIFY_REQUEST_TIMEOUT_SECONDS`
    - `APIFY_TRUSTPILOT_ACTOR_ID`, `APIFY_TRUSTPILOT_MAX_TOTAL_CHARGE_USD_PER_RUN`
    - `GOOGLE_SHEETS_ENABLED`, `GOOGLE_SHEET_ID`, `GOOGLE_SHEET_TAB`, `GOOGLE_SERVICE_ACCOUNT_JSON`
@@ -413,15 +414,16 @@ Create an Apify account and copy its API token from **Apify Console → Settings
 META_AD_PROVIDER=apify
 APIFY_API_TOKEN=<secret Apify API token>
 APIFY_ACTOR_ID=solidcode/meta-ads-library-scraper
-APIFY_MAX_RESULTS_PER_QUERY=500
-APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN=0.02
+APIFY_META_ACTOR_BUILD=1.0.7
+APIFY_MAX_RESULTS_PER_QUERY=15
+APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN=0.019
 APIFY_INCLUDE_ADVERTISER_DETAILS=true
 APIFY_MONTHLY_BUDGET_GBP=30
 APIFY_BUDGET_GBP_PER_USD=1.0
 APIFY_REQUEST_TIMEOUT_SECONDS=120
 ```
 
-The implementation follows the Actor's current [input/output reference and pricing](https://apify.com/solidcode/meta-ads-library-scraper) and [generated OpenAPI definition](https://apify.com/solidcode/meta-ads-library-scraper/api/openapi). It starts runs asynchronously through Apify's documented [Run Actor endpoint](https://docs.apify.com/api/v2/actors-runs-post), polls the [Get run endpoint](https://docs.apify.com/api/v2/actor-run-get), and pages through the [default dataset items endpoint](https://docs.apify.com/api/v2/actor-run-dataset-items-get). Tokens are sent in the recommended `Authorization: Bearer` header, never in URLs or logs.
+The implementation follows the Actor's current [input/output reference and pricing](https://apify.com/solidcode/meta-ads-library-scraper) and [generated OpenAPI definition](https://apify.com/solidcode/meta-ads-library-scraper/api/openapi). It starts runs asynchronously through Apify's documented [Run Actor endpoint](https://docs.apify.com/api/v2/actors-runs-post), using its `build` query parameter with exact build number `1.0.7`, polls the [Get run endpoint](https://docs.apify.com/api/v2/actor-run-get), and pages through the [default dataset items endpoint](https://docs.apify.com/api/v2/actor-run-dataset-items-get). Upgrade the build setting only after deliberate contract regression testing. Tokens are sent in the recommended `Authorization: Bearer` header, never in URLs or logs.
 
 Each country run sends only documented Actor input fields: `searchTerms`, `country`, `adActiveStatus="ACTIVE"`, `adType="ALL"`, `scrapeAdDetails=true`, `includeAboutPage`, `onlyTotalCount=false`, and `maxResults`. Creative-detail enrichment is enabled because it is the documented source of CTA landing URLs and snapshot URLs. `includeAboutPage` follows `APIFY_INCLUDE_ADVERTISER_DETAILS`; when enabled, the Actor documents page category, likes, verification, About text, linked Instagram username, and Instagram follower count.
 
@@ -448,7 +450,7 @@ The Actor's current public pricing metadata lists a $0.005 Actor-start event, $0
 
 Before any paid run starts, the provider reads `current.monthlyUsageUsd` from Apify's documented [account limits endpoint](https://docs.apify.com/api/v2/users-me-limits-get). It reserves `APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN` for every planned country run, converts the projected account usage using `APIFY_BUDGET_GBP_PER_USD`, and aborts if the total exceeds `APIFY_MONTHLY_BUDGET_GBP`. The default `1.0` deliberately treats each reported USD as £1, which is conservative relative to a lower GBP-per-USD rate; update the setting only if you intentionally want another budgeting rate. Every run receives the configured ceiling through Apify's documented `maxTotalChargeUsd` server-side parameter.
 
-The provider calculates the documented event-cost estimate using the configured result limit and enrichment flag. The per-run ceiling defaults to a conservative `$0.02` and is independent of the result-count limit. A ceiling below the calculated estimate is logged and can intentionally stop a large requested result set before all rows are collected. Non-positive ceilings and a single-run ceiling above the converted monthly budget are rejected during configuration; the full multi-country conflict reserves the entire configured ceiling for every planned run and checks it against live monthly usage before any paid run starts. `APIFY_MAX_RESULTS_PER_QUERY` is always positive, so unlimited Actor runs are not exposed. Read-only API calls retry bounded transient network, HTTP 429, and server failures. A paid Actor start is not automatically retried after a network error because an ambiguous retry could create a second billable run. Runs exceeding the configured timeout are aborted. The monthly pre-check is deliberately account-wide and fail-closed, but it cannot make independent concurrent processes atomic; use Apify's account spending controls as an additional account-level backstop.
+The provider calculates the documented event-cost estimate using the configured result limit and enrichment flag. The default 15 enriched rows project `$0.0185` per country, protected by a `$0.019` ceiling. Across the configured 20 countries twice daily, the event estimate is about `$22.20` per 30 days and the ceiling-based maximum is `$22.80`, using the deliberately conservative `$1 = £1` guard conversion. A ceiling below the calculated estimate is logged and can intentionally stop a requested result set before all rows are collected. Non-positive ceilings and a single-run ceiling above the converted monthly budget are rejected during configuration; the full multi-country conflict reserves the entire configured ceiling for every planned run and checks it against live monthly usage before any paid run starts. `APIFY_MAX_RESULTS_PER_QUERY` is always positive, so unlimited Actor runs are not exposed. Read-only API calls retry bounded transient network, HTTP 429, and server failures. A paid Actor start is not automatically retried after a network error because an ambiguous retry could create a second billable run. Runs exceeding either the per-country provider timeout or the whole-scan deadline are aborted. The monthly pre-check is deliberately account-wide and fail-closed, but it cannot make independent concurrent processes atomic; use Apify's account spending controls as an additional account-level backstop.
 
 ### Manual and Railway live test
 
@@ -461,10 +463,10 @@ python -m app.jobs.brand_scan --meta-only
 If the token exists only in Railway, do not copy it locally. After deploying this code, install and authenticate the current Railway CLI, link it to the project/service, then execute a capped test inside the running container:
 
 ```bash
-railway ssh -- env SCAN_REGIONS=UK APIFY_MAX_RESULTS_PER_QUERY=20 APIFY_INCLUDE_ADVERTISER_DETAILS=true APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN=0.03 python -m app.jobs.brand_scan --meta-only
+railway ssh -- env SCAN_REGIONS=UK APIFY_MAX_RESULTS_PER_QUERY=15 APIFY_INCLUDE_ADVERTISER_DETAILS=true APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN=0.019 python -m app.jobs.brand_scan --meta-only
 ```
 
-Railway's current [`railway ssh` documentation](https://docs.railway.com/cli/ssh) supports running a command in the deployed service. This override performs one UK country run with at most 20 fully enriched rows. Current documented event pricing projects $0.023: $0.005 to start plus 20 × $0.0009, protected by a hard $0.03 ceiling. It does not expose the token. The command invokes Meta discovery and, if enabled, persistence and candidate-sheet synchronization; it does not run a separate Instagram scraper, reviews, or scheduling.
+Railway's current [`railway ssh` documentation](https://docs.railway.com/cli/ssh) supports running a command in the deployed service. This override performs one UK country run with at most 15 fully enriched rows. Current documented event pricing projects $0.0185: $0.005 to start plus 15 × $0.0009, protected by a hard $0.019 ceiling. It does not expose the token. The command invokes Meta discovery and, if enabled, persistence and candidate-sheet synchronization; it does not run a separate Instagram scraper, reviews, or scheduling.
 
 A sanitised output shape is:
 

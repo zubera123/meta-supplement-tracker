@@ -174,6 +174,13 @@ class ScanPersistenceService:
                         or followers > maximum_followers
                     ):
                         continue
+                    spend = record.spend_estimate
+                    if (
+                        spend is not None
+                        and spend.method in {"impressions_cpm", "reach_cpm"}
+                        and spend.target_match is False
+                    ):
+                        continue
                     advertiser = repository.find_advertiser(record)
                     if advertiser is None:
                         raise DatabasePersistenceError(

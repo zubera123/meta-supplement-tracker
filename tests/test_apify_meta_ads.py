@@ -146,6 +146,8 @@ def test_successful_actor_run_uses_documented_contract_and_normalizes() -> None:
                 "maxResults": 500,
             }
             assert request.url.params["maxTotalChargeUsd"] == "0.02"
+            assert request.url.params["build"] == "1.0.7"
+            assert request.url.params["restartOnError"] == "false"
             return httpx.Response(201, json={"data": {"id": "run-1"}})
         if request.url.path == "/v2/actor-runs/run-1":
             return httpx.Response(
@@ -185,7 +187,96 @@ def test_successful_actor_run_uses_documented_contract_and_normalizes() -> None:
 def test_default_per_run_charge_ceiling() -> None:
     settings = Settings(_env_file=None)
 
-    assert settings.apify_max_total_charge_usd_per_run == 0.02
+    assert settings.apify_max_results_per_query == 15
+    assert settings.apify_max_total_charge_usd_per_run == 0.019
+    assert settings.apify_meta_actor_build == "1.0.7"
+
+
+def test_actor_request_uses_configured_exact_build() -> None:
+    requested_build: str | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requested_build
+        if request.url.path == "/v2/users/me/limits":
+            return httpx.Response(
+                200, json={"data": {"current": {"monthlyUsageUsd": 0}}}
+            )
+        if request.url.path.endswith("/runs"):
+            requested_build = request.url.params["build"]
+            return httpx.Response(201, json={"data": {"id": "run-1"}})
+        if request.url.path == "/v2/actor-runs/run-1":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "status": "SUCCEEDED",
+                        "defaultDatasetId": "dataset-1",
+                    }
+                },
+            )
+        if request.url.path == "/v2/datasets/dataset-1/items":
+            return httpx.Response(200, json=[])
+        raise AssertionError(f"Unexpected request: {request.url}")
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = ApifyMetaAdsProvider(
+                api_token="test-token",
+                actor_build="1.0.7",
+                client=client,
+            )
+            await provider.retrieve_advertisers(
+                regions=["UK"], categories=["supplements"]
+            )
+
+    asyncio.run(run())
+
+    assert requested_build == "1.0.7"
+
+
+def test_cancellation_aborts_current_run_without_starting_next_country() -> None:
+    starts = 0
+    aborts = 0
+
+    class YieldingTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(0)
+            return handler(request)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal starts, aborts
+        if request.url.path == "/v2/users/me/limits":
+            return httpx.Response(
+                200, json={"data": {"current": {"monthlyUsageUsd": 0}}}
+            )
+        if request.url.path.endswith("/runs"):
+            starts += 1
+            return httpx.Response(201, json={"data": {"id": "run-1"}})
+        if request.url.path == "/v2/actor-runs/run-1/abort":
+            aborts += 1
+            return httpx.Response(201, json={"data": {"id": "run-1"}})
+        if request.url.path == "/v2/actor-runs/run-1":
+            return httpx.Response(200, json={"data": {"status": "RUNNING"}})
+        raise AssertionError(f"Unexpected request: {request.url}")
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=YieldingTransport()) as client:
+            provider = ApifyMetaAdsProvider(
+                api_token="test-token",
+                client=client,
+                retry_min_wait_seconds=0,
+                retry_max_wait_seconds=0,
+            )
+            async with asyncio.timeout(0.1):
+                await provider.retrieve_advertisers(
+                    regions=["UK", "USA"], categories=["supplements"]
+                )
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(run())
+
+    assert starts == 1
+    assert aborts == 1
 
 
 def test_per_run_charge_ceiling_environment_override(

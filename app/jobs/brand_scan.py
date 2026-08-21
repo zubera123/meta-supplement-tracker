@@ -151,6 +151,10 @@ class CandidatePipelineResult:
     sheet_sync: SheetSyncResult | None
 
 
+class ScanRuntimeExceededError(ProviderError):
+    """Raised when one complete production scan exceeds its global deadline."""
+
+
 class CandidatePipeline:
     """Run the real candidate pipeline once using configured provider services."""
 
@@ -184,6 +188,7 @@ class CandidatePipeline:
         if self.persistence is not None:
             # Fail before any paid provider call when persistence is unavailable.
             self.persistence.verify_connection()
+        await asyncio.sleep(0)
 
         try:
             if self.persistence is not None:
@@ -193,27 +198,34 @@ class CandidatePipeline:
                     scan_run_id,
                     ",".join(self.settings.regions),
                 )
+            await asyncio.sleep(0)
             if self.sheets is not None:
                 # Fail before any paid provider call; because the scan-run row now
                 # exists, a failed output preflight is recorded durably.
                 self.sheets.ensure_ready()
+            # Deliver a pending whole-scan cancellation before a paid Actor starts.
+            await asyncio.sleep(0)
             records = await self.meta_ads.retrieve_advertisers(
                 regions=self.settings.regions,
                 categories=self.settings.categories,
             )
+            await asyncio.sleep(0)
             histories = (
                 self.persistence.load_spend_histories(records)
                 if self.persistence is not None
                 else [None] * len(records)
             )
-            records = [
-                record.model_copy(
-                    update={
-                        "spend_estimate": self.spend_estimator.estimate(record, history)
-                    }
+            estimated_records: list[AdRecord] = []
+            for record, history in zip(records, histories, strict=True):
+                estimated_records.append(
+                    record.model_copy(
+                        update={
+                            "spend_estimate": self.spend_estimator.estimate(record, history)
+                        }
+                    )
                 )
-                for record, history in zip(records, histories, strict=True)
-            ]
+                await asyncio.sleep(0)
+            records = estimated_records
             relevance_results = tuple(
                 self.relevance_filter.evaluate(record) for record in records
             )
@@ -240,6 +252,7 @@ class CandidatePipeline:
                 self.persistence.persist_success(
                     scan_run_id, records, relevance_results
                 )
+            await asyncio.sleep(0)
 
             sheet_sync: SheetSyncResult | None = None
             if self.sheets is not None and self.persistence is not None:
@@ -251,6 +264,7 @@ class CandidatePipeline:
                 )
                 sheet_sync = self.sheets.sync_candidates(candidates, row_states)
                 self.persistence.save_sheet_row_states(sheet_sync.row_states)
+            await asyncio.sleep(0)
             ads_found = sum(len(record.ads) for record in records)
             candidates_written = (
                 sheet_sync.appended + sheet_sync.updated if sheet_sync else 0
@@ -266,6 +280,20 @@ class CandidatePipeline:
             return CandidatePipelineResult(
                 records, relevance_results, scan_run_id, sheet_sync
             )
+        except asyncio.CancelledError:
+            timeout_error = ScanRuntimeExceededError(
+                "Candidate scan exceeded "
+                f"SCAN_MAX_RUNTIME_SECONDS={self.settings.scan_max_runtime_seconds:g}"
+            )
+            logger.error(
+                "Candidate scan completed status=failed scan_run_id=%s "
+                "failure_reason=%s",
+                scan_run_id,
+                timeout_error,
+            )
+            if self.persistence is not None and scan_run_id is not None:
+                self.persistence.record_failure(scan_run_id, timeout_error)
+            raise
         except Exception as exc:
             logger.exception(
                 "Candidate scan completed status=failed scan_run_id=%s "
@@ -483,7 +511,14 @@ async def _run_meta_only(settings: Settings) -> int:
 async def _run_once(settings: Settings) -> int:
     """Run the complete production candidate pipeline exactly once."""
 
-    return await _run_scan_command(settings, require_full_outputs=True)
+    try:
+        async with asyncio.timeout(settings.scan_max_runtime_seconds):
+            return await _run_scan_command(settings, require_full_outputs=True)
+    except TimeoutError as exc:
+        raise ScanRuntimeExceededError(
+            "Candidate scan exceeded "
+            f"SCAN_MAX_RUNTIME_SECONDS={settings.scan_max_runtime_seconds:g}"
+        ) from exc
 
 
 def _build_meta_provider(settings: Settings) -> MetaAdsProvider:
@@ -492,6 +527,7 @@ def _build_meta_provider(settings: Settings) -> MetaAdsProvider:
         return ApifyMetaAdsProvider(
             api_token=settings.apify_api_token,
             actor_id=settings.apify_actor_id,
+            actor_build=settings.apify_meta_actor_build,
             max_results_per_query=settings.apify_max_results_per_query,
             max_total_charge_usd_per_run=(
                 settings.apify_max_total_charge_usd_per_run

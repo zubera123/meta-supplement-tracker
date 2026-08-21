@@ -1,5 +1,6 @@
 """Meta advertising providers backed by documented HTTP contracts."""
 
+import asyncio
 import json
 import logging
 import time
@@ -153,8 +154,9 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
         *,
         api_token: str | None,
         actor_id: str = "solidcode/meta-ads-library-scraper",
-        max_results_per_query: int = 500,
-        max_total_charge_usd_per_run: float = 0.02,
+        actor_build: str = "1.0.7",
+        max_results_per_query: int = 15,
+        max_total_charge_usd_per_run: float = 0.019,
         include_advertiser_details: bool = True,
         monthly_budget_gbp: float = 30.0,
         budget_gbp_per_usd: float = 1.0,
@@ -170,6 +172,8 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
             )
         if not actor_id.strip():
             raise ProviderConfigurationError("APIFY_ACTOR_ID must not be empty")
+        if not actor_build.strip():
+            raise ProviderConfigurationError("APIFY_META_ACTOR_BUILD must not be empty")
         if max_results_per_query < 1:
             raise ProviderConfigurationError(
                 "APIFY_MAX_RESULTS_PER_QUERY must be at least 1"
@@ -193,6 +197,7 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
         self._api_token = api_token
         self._headers = {"Authorization": f"Bearer {api_token}"}
         self._actor_id = actor_id.strip()
+        self._actor_build = actor_build.strip()
         actor_ref = self._actor_id.replace("/", "~")
         self._actor_ref = quote(actor_ref, safe="~")
         self._max_results = max_results_per_query
@@ -263,6 +268,7 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
             provider="apify",
             provider_metadata={
                 "actor_id": self._actor_id,
+                "actor_build": self._actor_build,
                 "commercial_spend_available": False,
                 "max_total_charge_usd_per_run": float(
                     self._max_total_charge_usd_per_run
@@ -405,10 +411,13 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
         }
         params = {
             "timeout": str(max(1, int(self._request_timeout_seconds))),
+            "build": self._actor_build,
             "maxTotalChargeUsd": format(
                 self._max_total_charge_usd_per_run, "f"
             ),
+            "restartOnError": "false",
         }
+        run_id: str | None = None
         try:
             response = await client.post(
                 endpoint, params=params, json=actor_input, headers=self._headers
@@ -419,24 +428,38 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
             raise ProviderError(
                 f"Apify Actor start request failed without a safe retry: {type(exc).__name__}"
             ) from exc
-        payload = _response_json_object(response, "Apify Actor start")
-        if response.status_code >= 400:
-            raise ProviderError(_apify_http_error("Actor start", response, payload))
-        data = payload.get("data")
-        run_id = data.get("id") if isinstance(data, dict) else None
-        if not isinstance(run_id, str) or not run_id:
-            raise ProviderError("Apify Actor start response did not contain data.id")
+        try:
+            payload = _response_json_object(response, "Apify Actor start")
+            if response.status_code >= 400:
+                raise ProviderError(_apify_http_error("Actor start", response, payload))
+            data = payload.get("data")
+            run_id = data.get("id") if isinstance(data, dict) else None
+            if not isinstance(run_id, str) or not run_id:
+                raise ProviderError("Apify Actor start response did not contain data.id")
 
-        run = await self._wait_for_run(client, run_id)
-        status = run.get("status")
-        if status != "SUCCEEDED":
-            message = run.get("statusMessage")
-            detail = f": {message}" if isinstance(message, str) and message else ""
-            raise ProviderError(f"Apify Actor run {run_id} ended with {status}{detail}")
-        dataset_id = run.get("defaultDatasetId")
-        if not isinstance(dataset_id, str) or not dataset_id:
-            raise ProviderError("Successful Apify Actor run has no defaultDatasetId")
-        return await self._get_dataset_items(client, dataset_id)
+            run = await self._wait_for_run(client, run_id)
+            status = run.get("status")
+            if status != "SUCCEEDED":
+                message = run.get("statusMessage")
+                detail = f": {message}" if isinstance(message, str) and message else ""
+                raise ProviderError(f"Apify Actor run {run_id} ended with {status}{detail}")
+            dataset_id = run.get("defaultDatasetId")
+            if not isinstance(dataset_id, str) or not dataset_id:
+                raise ProviderError("Successful Apify Actor run has no defaultDatasetId")
+            return await self._get_dataset_items(client, dataset_id)
+        except asyncio.CancelledError:
+            if run_id is not None:
+                try:
+                    await asyncio.wait_for(
+                        self._abort_timed_out_run(client, run_id),
+                        timeout=min(10.0, self._request_timeout_seconds),
+                    )
+                except (TimeoutError, ProviderError):
+                    logger.exception(
+                        "Could not confirm cancellation of Apify Actor run %s",
+                        run_id,
+                    )
+            raise
 
     async def _wait_for_run(
         self, client: httpx.AsyncClient, run_id: str

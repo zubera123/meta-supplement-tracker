@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     target_max_instagram_followers: int = Field(default=100_000, ge=0)
     desirable_trustpilot_review_count: int = Field(default=300, ge=0)
     scan_interval_hours: int = Field(default=12, ge=1)
+    scan_max_runtime_seconds: float = Field(default=2700.0, gt=0, le=86_400)
     provider_retry_attempts: int = Field(default=3, ge=1, le=10)
     provider_retry_min_wait_seconds: float = Field(default=1.0, ge=0)
     provider_retry_max_wait_seconds: float = Field(default=10.0, ge=0)
@@ -79,8 +80,9 @@ class Settings(BaseSettings):
     meta_max_pages_per_query: int = Field(default=100, ge=1, le=10_000)
     apify_api_token: str | None = None
     apify_actor_id: str = "solidcode/meta-ads-library-scraper"
-    apify_max_results_per_query: int = Field(default=500, ge=1, le=50_000)
-    apify_max_total_charge_usd_per_run: float = Field(default=0.02, gt=0)
+    apify_meta_actor_build: str = Field(default="1.0.7", min_length=1)
+    apify_max_results_per_query: int = Field(default=15, ge=1, le=50_000)
+    apify_max_total_charge_usd_per_run: float = Field(default=0.019, gt=0)
     apify_include_advertiser_details: bool = True
     apify_monthly_budget_gbp: float = Field(default=30.0, gt=0)
     apify_budget_gbp_per_usd: float = Field(default=1.0, gt=0)

@@ -80,6 +80,16 @@ def production_settings() -> Settings:
     )
 
 
+def test_global_scan_timeout_default_and_environment_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert Settings(_env_file=None).scan_max_runtime_seconds == 2700
+
+    monkeypatch.setenv("SCAN_MAX_RUNTIME_SECONDS", "1800")
+
+    assert Settings(_env_file=None).scan_max_runtime_seconds == 1800
+
+
 def patch_runtime(
     monkeypatch: pytest.MonkeyPatch,
     persistence: FakePersistence,
@@ -128,6 +138,63 @@ def test_railway_cron_entry_point_exits_without_process_restarts() -> None:
     )
     assert config["deploy"]["restartPolicyType"] == "NEVER"
     assert "healthcheckPath" not in config["deploy"]
+
+    web_config = json.loads(Path("railway.json").read_text(encoding="utf-8"))
+    assert web_config["deploy"]["preDeployCommand"] == "alembic upgrade head"
+    assert "preDeployCommand" not in config["deploy"]
+
+
+def test_global_timeout_before_discovery_exits_nonzero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"discovery": 0}
+
+    async def stalled_preflight(
+        settings: Settings, *, require_full_outputs: bool
+    ) -> int:
+        assert require_full_outputs is True
+        await asyncio.sleep(10)
+        calls["discovery"] += 1
+        return 0
+
+    monkeypatch.setattr(brand_scan, "_run_scan_command", stalled_preflight)
+    configured = production_settings().model_copy(
+        update={"scan_max_runtime_seconds": 0.01}
+    )
+
+    with pytest.raises(ProviderError, match="SCAN_MAX_RUNTIME_SECONDS"):
+        asyncio.run(brand_scan._run_once(configured))
+
+    assert calls["discovery"] == 0
+
+
+def test_global_timeout_releases_scan_lock_and_closes_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock = FakeLock()
+    persistence = FakePersistence(lock)
+    calls = patch_runtime(monkeypatch, persistence)
+
+    class SlowPipeline:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        async def run(self) -> CandidatePipelineResult:
+            calls["pipeline_runs"] += 1
+            await asyncio.sleep(10)
+            raise AssertionError("unreachable")
+
+    monkeypatch.setattr(brand_scan, "CandidatePipeline", SlowPipeline)
+    configured = production_settings().model_copy(
+        update={"scan_max_runtime_seconds": 0.01}
+    )
+
+    with pytest.raises(ProviderError, match="SCAN_MAX_RUNTIME_SECONDS"):
+        asyncio.run(brand_scan._run_once(configured))
+
+    assert calls == {"provider_builds": 1, "pipeline_runs": 1}
+    assert lock.release_calls == 1
+    assert persistence.closed is True
 
 
 def test_overlap_skips_before_paid_provider_is_built(

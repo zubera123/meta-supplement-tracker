@@ -14,7 +14,7 @@ from app.db import DatabaseUnavailableError, ScanPersistenceService
 from app.db.base import Base
 from app.db.models import Ad, Advertiser, AdvertiserObservation, ScanRun
 from app.jobs.brand_scan import CandidatePipeline, _run_once
-from app.models import AdRecord, Brand, MetaAdDetails, Region, SocialStats
+from app.models import AdRecord, Brand, MetaAdDetails, Region, SocialStats, SpendEstimate
 from app.services import ProviderError
 from app.services.google_sheets import SHEET_HEADERS, GoogleSheetsProvider
 
@@ -271,6 +271,141 @@ def test_nonqualifying_followers_are_persisted_but_not_written(
         stored = session.scalar(select(Advertiser))
         assert stored is not None
         assert stored.latest_instagram_followers == followers
+
+
+@pytest.mark.parametrize(
+    ("estimate", "expected_rows"),
+    [
+        (
+            SpendEstimate(
+                low_usd=8_000,
+                high_usd=12_000,
+                method="impressions_cpm",
+                source="Impressions × CPM",
+                confidence="medium",
+                target_match=True,
+            ),
+            1,
+        ),
+        (
+            SpendEstimate(
+                low_usd=500,
+                high_usd=1_000,
+                method="impressions_cpm",
+                source="Impressions × CPM",
+                confidence="medium",
+                target_match=False,
+            ),
+            0,
+        ),
+        (
+            SpendEstimate(
+                low_usd=40_000,
+                high_usd=60_000,
+                method="reach_cpm",
+                source="Reach × CPM",
+                confidence="low",
+                target_match=False,
+            ),
+            0,
+        ),
+        (
+            SpendEstimate(
+                low_usd=900,
+                high_usd=4_500,
+                method="activity_model",
+                source="Activity model - very rough",
+                confidence="very_low",
+                target_match=None,
+            ),
+            1,
+        ),
+        (
+            SpendEstimate(
+                method="unknown",
+                source="Unknown",
+                confidence="unknown",
+                target_match=None,
+            ),
+            1,
+        ),
+    ],
+)
+def test_reliable_spend_result_controls_sheet_eligibility_but_not_persistence(
+    session_factory: sessionmaker[Session],
+    estimate: SpendEstimate,
+    expected_rows: int,
+) -> None:
+    class FixedSpendEstimator:
+        def estimate(self, item: AdRecord, history: object) -> SpendEstimate:
+            return estimate
+
+    item = record(
+        page_id=f"spend-{estimate.method}-{expected_rows}",
+        followers=25_000,
+        observed_at=datetime(2026, 8, 21, tzinfo=UTC),
+    )
+    sheet_api = MemorySheetsApi()
+
+    result = asyncio.run(
+        CandidatePipeline(
+            settings=settings(),
+            meta_ads=FakeMetaProvider([item]),
+            persistence=ScanPersistenceService(session_factory),
+            sheets=sheets_provider(sheet_api),
+            spend_estimator=FixedSpendEstimator(),  # type: ignore[arg-type]
+        ).run()
+    )
+
+    assert result.sheet_sync is not None
+    assert result.sheet_sync.appended == expected_rows
+    assert len(sheet_api.rows) == expected_rows + 1
+    with session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(Advertiser)) == 1
+        observation = session.scalar(select(AdvertiserObservation))
+        assert observation is not None
+        assert observation.spend_target_match is estimate.target_match
+
+
+def test_pipeline_deadline_during_discovery_records_failed_scan(
+    session_factory: sessionmaker[Session],
+) -> None:
+    class SlowMetaProvider(FakeMetaProvider):
+        async def retrieve_advertisers(
+            self, *, regions: tuple[str, ...], categories: tuple[str, ...]
+        ) -> list[AdRecord]:
+            self.calls += 1
+            await asyncio.sleep(10)
+            return []
+
+    provider = SlowMetaProvider([])
+    persistence = ScanPersistenceService(session_factory)
+
+    async def run() -> None:
+        async with asyncio.timeout(0.1):
+            await CandidatePipeline(
+                settings=Settings(
+                    _env_file=None,
+                    scan_regions="UK",
+                    supplement_categories="supplements",
+                    persist_scan_results=True,
+                    google_sheets_enabled=True,
+                    scan_max_runtime_seconds=0.1,
+                ),
+                meta_ads=provider,
+                persistence=persistence,
+                sheets=sheets_provider(MemorySheetsApi()),
+            ).run()
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(run())
+
+    assert provider.calls == 1
+    with session_factory() as session:
+        scan_run = session.scalar(select(ScanRun))
+        assert scan_run is not None
+        assert scan_run.status == "failed"
+        assert "SCAN_MAX_RUNTIME_SECONDS" in (scan_run.error_message or "")
 
 
 def test_irrelevant_advertiser_is_persisted_with_reason_but_not_written(
