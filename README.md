@@ -112,6 +112,7 @@ Settings are loaded from environment variables and, for local development, `.env
 | `APIFY_REQUEST_TIMEOUT_SECONDS` | `120`; overall wait limit for each Actor run |
 | `APIFY_TRUSTPILOT_ACTOR_ID` | `automation-lab/trustpilot-scraper` |
 | `APIFY_TRUSTPILOT_MAX_TOTAL_CHARGE_USD_PER_RUN` | `0.01`; strict server-side ceiling for each review lookup |
+| `TRUSTPILOT_MAX_UNIQUE_LOOKUPS_PER_DAY` | `10`; durable UTC-day cap on uncached paid domain lookups |
 | `INSTAGRAM_PROVIDER`, `INSTAGRAM_API_KEY` | Instagram provider placeholders |
 | `REVIEWS_ENABLED` | `false`; enables optional candidate review enrichment |
 | `REVIEWS_PROVIDER` | `apify_trustpilot` (practical default) or `trustpilot`; ignored when reviews are disabled |
@@ -195,17 +196,19 @@ Set `REVIEWS_ENABLED=true` to enrich only advertisers that already pass suppleme
 
 ### Apify provider (practical default)
 
-`REVIEWS_PROVIDER=apify_trustpilot` uses the existing `APIFY_API_TOKEN` with [`automation-lab/trustpilot-scraper`](https://apify.com/automation-lab/trustpilot-scraper). The Actor's current documented input schema supports `mode`, `searchQueries`, and `maxResults`; its documented business result contains `businessId`, `domain`, `trustScore`, `stars`, and `numberOfReviews`. Each lookup submits exactly:
+`REVIEWS_PROVIDER=apify_trustpilot` uses the existing `APIFY_API_TOKEN` with [`automation-lab/trustpilot-scraper`](https://apify.com/automation-lab/trustpilot-scraper). A production validation with `uk.protein.com` confirmed the Actor's documented direct profile path. Each lookup submits exactly:
 
 ```json
-{"mode":"search","searchQueries":["the-real-ad-domain.example"],"maxResults":1}
+{"mode":"reviews","businessUrls":["the-real-ad-domain.example"],"maxResults":1}
 ```
 
-The query value comes only from an existing ad's `landing_page_domain`, or from the hostname of its genuine `landing_page_url` when no documented domain is present. It is never derived from the advertiser name. Returned data is accepted only when `type=business` and the normalized `domain` exactly matches the submitted domain. The dataset request selects only business metadata fields; no review text is requested. A missing or mismatched result stays unknown.
+The domain comes only from an existing ad's `landing_page_domain`, or from the hostname of its genuine `landing_page_url` when no documented domain is present. It is never derived from the advertiser name. The provider reads up to two items so it can locate the `type=business` record emitted alongside an optional review, ignores every `type=review` record and all review text, and normalizes only `businessId`, `domain`, `numberOfReviews`, `trustScore`, `stars`, and `profileUrl`. The normalized business domain must exactly match the submitted domain; a missing or mismatched business stays unknown.
 
-As documented on the Actor page on 21 August 2026, pricing is pay per event: $0.001 per run start plus $0.00345/Free, $0.00300/Bronze, $0.00234/Silver, $0.00180/Gold, $0.00120/Platinum, or $0.00084/Diamond per result. One business-result lookup therefore costs approximately $0.00445 on Free and $0.00400 on Bronze, before any included Apify credits. The live Pricing tab remains authoritative. The app sends both Apify's documented `maxItems=1` and `maxTotalChargeUsd=0.01`, with `restartOnError=false`.
+As documented on the Actor page on 21 August 2026, pricing is pay per event: $0.001 per run start plus $0.00345/Free, $0.00300/Bronze, $0.00234/Silver, $0.00180/Gold, $0.00120/Platinum, or $0.00084/Diamond per business. One conservative business-result lookup therefore costs approximately $0.00445 on Free and $0.00400 on Bronze, before any included Apify credits; the verified `uk.protein.com` run charged $0.001. The live Pricing tab remains authoritative. The app uses `maxItems=2` to retain the business record when one review record accompanies it, and sends `maxTotalChargeUsd=0.01` with `restartOnError=false`.
 
-Before every paid review start, the provider reads account-wide `current.monthlyUsageUsd` from Apify's [Get limits endpoint](https://docs.apify.com/api/v2/users-me-limits-get). Current usage, conservative in-process reservations, and the next $0.01 ceiling are converted with `APIFY_BUDGET_GBP_PER_USD` and rejected if they would exceed `APIFY_MONTHLY_BUDGET_GBP` (£30 by default). This budget includes both Meta and review Actor usage because Apify reports account-wide usage. The paid start request is never retried; only safe run-status and dataset reads use bounded transient retries. Actor failures, timeouts, malformed results, and budget rejections fail softly for that advertiser and preserve earlier valid Sheet review values.
+Before every paid review start, the provider reads account-wide `current.monthlyUsageUsd` from Apify's [Get limits endpoint](https://docs.apify.com/api/v2/users-me-limits-get). Current usage, conservative in-process reservations, and the next $0.01 ceiling are converted with `APIFY_BUDGET_GBP_PER_USD` and rejected if they would exceed `APIFY_MONTHLY_BUDGET_GBP` (£30 by default). This budget includes both Meta and review Actor usage because Apify reports account-wide usage.
+
+PostgreSQL then atomically reserves the exact domain in a UTC-day paid-lookup ledger. At the default `TRUSTPILOT_MAX_UNIQUE_LOOKUPS_PER_DAY=10`, the eleventh uncached unique domain is deferred with an internal persisted reason and no paid start. A domain is reserved immediately before its single start, so an ambiguous network response remains conservatively counted. Successful cache hits bypass the ledger and remain usable after the cap is reached. At ten new lookups per day, documented Free-tier pricing projects about $1.34 per 30-day month (the hard `$0.01` ceiling would be $3). The paid start request is never retried; only safe run-status and dataset reads use bounded transient retries. Actor failures, timeouts, malformed results, deferrals, and budget rejections fail softly for that advertiser and preserve earlier valid Sheet review values.
 
 Configure the same shared/reference values on the Railway web and Cron services:
 
@@ -217,6 +220,7 @@ APIFY_TRUSTPILOT_ACTOR_ID=automation-lab/trustpilot-scraper
 APIFY_TRUSTPILOT_MAX_TOTAL_CHARGE_USD_PER_RUN=0.01
 TRUSTPILOT_MIN_DESIRABLE_REVIEWS=300
 TRUSTPILOT_REFRESH_HOURS=24
+TRUSTPILOT_MAX_UNIQUE_LOOKUPS_PER_DAY=10
 ```
 
 `python -m app.jobs.brand_scan --check-reviews` validates the Apify token, account-limits endpoint, and Actor metadata with authenticated GET requests. It reports `actor_started=false` and never constructs the Meta provider or starts either paid Actor.
@@ -256,7 +260,7 @@ Verify the selected provider without starting Meta discovery or a paid Actor:
 python -m app.jobs.brand_scan --check-reviews
 ```
 
-For the official provider, the check resolves Trustpilot's own documented domain. For the Apify provider, it uses only free metadata/limits GET requests. Both print only provider/connectivity status. Apply migrations through `20260821_0006` before enabling the Apify provider; `0006` adds only a cached review-source column so `Trustpilot via Apify` survives refresh-cache reuse. The existing review observation/history tables are reused.
+For the official provider, the check resolves Trustpilot's own documented domain. For the Apify provider, it uses only free metadata/limits GET requests. Both print only provider/connectivity status. Apply migrations through `20260821_0008` before enabling the Apify provider; `0008` adds the paid-lookup ledger and preserves the genuine Trustpilot profile URL in the existing advertiser cache/history.
 
 ## Google Sheets candidate output
 
@@ -382,7 +386,7 @@ The expression runs every day at **00:00 UTC** and **12:00 UTC**. Railway evalua
    - `APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN`, `APIFY_INCLUDE_ADVERTISER_DETAILS`, `APIFY_MONTHLY_BUDGET_GBP`, `APIFY_BUDGET_GBP_PER_USD`, `APIFY_REQUEST_TIMEOUT_SECONDS`
    - `APIFY_TRUSTPILOT_ACTOR_ID`, `APIFY_TRUSTPILOT_MAX_TOTAL_CHARGE_USD_PER_RUN`
    - `GOOGLE_SHEETS_ENABLED`, `GOOGLE_SHEET_ID`, `GOOGLE_SHEET_TAB`, `GOOGLE_SERVICE_ACCOUNT_JSON`
-   - `REVIEWS_ENABLED`, `REVIEWS_PROVIDER`, `TRUSTPILOT_API_KEY`, `TRUSTPILOT_MIN_DESIRABLE_REVIEWS`, `TRUSTPILOT_REFRESH_HOURS`, `TRUSTPILOT_REQUEST_TIMEOUT_SECONDS`, `TRUSTPILOT_MIN_REQUEST_INTERVAL_SECONDS`
+   - `REVIEWS_ENABLED`, `REVIEWS_PROVIDER`, `TRUSTPILOT_API_KEY`, `TRUSTPILOT_MIN_DESIRABLE_REVIEWS`, `TRUSTPILOT_REFRESH_HOURS`, `TRUSTPILOT_MAX_UNIQUE_LOOKUPS_PER_DAY`, `TRUSTPILOT_REQUEST_TIMEOUT_SECONDS`, `TRUSTPILOT_MIN_REQUEST_INTERVAL_SECONDS`
 
    The production values must still make `PERSIST_SCAN_RESULTS=true` and `GOOGLE_SHEETS_ENABLED=true`; `--run-once` fails closed otherwise. Do not give the Cron service a public domain.
 6. Review Railway's staged service and variable changes, then deploy the Cron service. No paid scan runs at deploy time; the command runs only at the next scheduled execution or an explicitly requested manual execution.

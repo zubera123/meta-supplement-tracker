@@ -1,10 +1,10 @@
 """Transactional service for persisting complete Meta scan results."""
 
 import logging
-from datetime import UTC
+from datetime import UTC, datetime
 from collections.abc import Sequence
 
-from sqlalchemy import Engine, select, text
+from sqlalchemy import Engine, func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -18,6 +18,7 @@ from app.db.session import (
 from app.db.models import (
     Ad, Advertiser, AdvertiserObservation, Company, CompanyCandidateEvent,
     CompanyObservation, GoogleSheetRow, ScanRun, utc_now,
+    TrustpilotPaidLookup,
 )
 from app.models import (
     AdRecord,
@@ -395,6 +396,62 @@ class ScanPersistenceService:
         except SQLAlchemyError as exc:
             raise DatabasePersistenceError(
                 "Could not load Trustpilot review cache"
+            ) from exc
+
+    def reserve_trustpilot_paid_lookup(
+        self,
+        domain: str,
+        daily_limit: int,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[bool, str]:
+        """Atomically reserve one unique paid domain lookup for the UTC day."""
+
+        observed_at = now or datetime.now(UTC)
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=UTC)
+        lookup_date = observed_at.astimezone(UTC).date()
+        try:
+            with self._session_factory.begin() as session:
+                if session.bind is not None and session.bind.dialect.name == "postgresql":
+                    # Serialize the count-and-insert decision across web/Cron processes.
+                    session.execute(
+                        text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                        {"lock_key": 7_321_984_231_104_077},
+                    )
+                existing = session.scalar(
+                    select(TrustpilotPaidLookup.id)
+                    .where(TrustpilotPaidLookup.lookup_date == lookup_date)
+                    .where(TrustpilotPaidLookup.domain == domain)
+                )
+                if existing is not None:
+                    return (
+                        False,
+                        "Trustpilot lookup deferred: this domain already had a paid "
+                        "lookup reserved today (UTC)",
+                    )
+                used = session.scalar(
+                    select(func.count())
+                    .select_from(TrustpilotPaidLookup)
+                    .where(TrustpilotPaidLookup.lookup_date == lookup_date)
+                ) or 0
+                if used >= daily_limit:
+                    return (
+                        False,
+                        "Trustpilot lookup deferred: UTC daily unique paid lookup "
+                        f"limit of {daily_limit} is exhausted",
+                    )
+                session.add(
+                    TrustpilotPaidLookup(
+                        lookup_date=lookup_date,
+                        domain=domain,
+                        reserved_at=observed_at,
+                    )
+                )
+                return True, "Trustpilot paid lookup reserved"
+        except SQLAlchemyError as exc:
+            raise DatabasePersistenceError(
+                "Could not enforce the Trustpilot daily paid-lookup limit"
             ) from exc
 
     def load_spend_histories(

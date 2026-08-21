@@ -16,6 +16,7 @@ from app.db.models import (
     AdvertiserObservation,
     GoogleSheetRow,
     ScanRun,
+    TrustpilotPaidLookup,
 )
 from app.db.service import ScanPersistenceService
 from app.db.session import DatabaseConfigurationError, normalize_database_url
@@ -394,6 +395,7 @@ def test_apify_review_source_survives_cache_round_trip(
         review_count=425,
         business_unit_id="business-unit-1",
         matched_domain="example.com",
+        profile_url="https://www.trustpilot.com/review/example.com",
         observed_at=observed_at,
     )
     record = ad_record(observed_at=observed_at, followers=20_000).model_copy(
@@ -414,3 +416,39 @@ def test_apify_review_source_survives_cache_round_trip(
 
     assert cache.latest_stats is not None
     assert cache.latest_stats.source == "Trustpilot via Apify"
+    assert str(cache.latest_stats.profile_url) == (
+        "https://www.trustpilot.com/review/example.com"
+    )
+
+
+def test_trustpilot_paid_lookup_limit_is_unique_and_resets_each_utc_day(
+    session_factory: sessionmaker[Session],
+) -> None:
+    service = ScanPersistenceService(session_factory)
+    first_day = datetime(2026, 8, 21, 23, 0, tzinfo=UTC)
+
+    for index in range(10):
+        allowed, _ = service.reserve_trustpilot_paid_lookup(
+            f"brand-{index}.example.com", 10, now=first_day
+        )
+        assert allowed is True
+
+    duplicate, duplicate_reason = service.reserve_trustpilot_paid_lookup(
+        "brand-0.example.com", 10, now=first_day
+    )
+    overflow, overflow_reason = service.reserve_trustpilot_paid_lookup(
+        "brand-10.example.com", 10, now=first_day
+    )
+    next_day, _ = service.reserve_trustpilot_paid_lookup(
+        "brand-10.example.com", 10, now=first_day + timedelta(hours=2)
+    )
+
+    assert duplicate is False
+    assert "already" in duplicate_reason
+    assert overflow is False
+    assert "limit of 10" in overflow_reason
+    assert next_day is True
+    with session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(TrustpilotPaidLookup)
+        ) == 11

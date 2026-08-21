@@ -105,6 +105,7 @@ class Settings(BaseSettings):
     trustpilot_api_key: str | None = None
     trustpilot_min_desirable_reviews: int = Field(default=300, ge=0)
     trustpilot_refresh_hours: int = Field(default=24, ge=1, le=720)
+    trustpilot_max_unique_lookups_per_day: int = Field(default=10, ge=1, le=10_000)
     trustpilot_request_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     trustpilot_min_request_interval_seconds: float = Field(default=0.4, ge=0, le=60)
 

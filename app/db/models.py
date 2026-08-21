@@ -102,6 +102,7 @@ class Advertiser(Base):
     latest_trustpilot_review_source: Mapped[str | None] = mapped_column(String(50))
     latest_trustpilot_trust_score: Mapped[float | None] = mapped_column(Numeric(3, 2))
     latest_trustpilot_stars: Mapped[float | None] = mapped_column(Numeric(2, 1))
+    latest_trustpilot_profile_url: Mapped[str | None] = mapped_column(Text)
     first_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -174,6 +175,7 @@ class AdvertiserObservation(Base):
     review_stars: Mapped[float | None] = mapped_column(Numeric(2, 1))
     review_business_unit_id: Mapped[str | None] = mapped_column(String(255))
     review_matched_domain: Mapped[str | None] = mapped_column(String(500))
+    review_profile_url: Mapped[str | None] = mapped_column(Text)
     review_desirable: Mapped[bool | None] = mapped_column()
     review_status: Mapped[str | None] = mapped_column(String(20))
     review_reason: Mapped[str | None] = mapped_column(Text)
@@ -183,6 +185,23 @@ class AdvertiserObservation(Base):
 
     advertiser: Mapped[Advertiser] = relationship(back_populates="observations")
     scan_run: Mapped[ScanRun] = relationship(back_populates="observations")
+
+
+class TrustpilotPaidLookup(Base):
+    """One conservatively reserved paid Trustpilot domain lookup per UTC day."""
+
+    __tablename__ = "trustpilot_paid_lookups"
+    __table_args__ = (
+        UniqueConstraint("lookup_date", "domain"),
+        Index("ix_trustpilot_paid_lookups_lookup_date", "lookup_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    lookup_date: Mapped[date] = mapped_column(Date, nullable=False)
+    domain: Mapped[str] = mapped_column(String(500), nullable=False)
+    reserved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
 
 
 class GoogleSheetRow(Base):

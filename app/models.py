@@ -152,6 +152,7 @@ class ReviewStats(BaseModel):
     star_score: float | None = Field(default=None, ge=0, le=5)
     business_unit_id: str | None = None
     matched_domain: str | None = None
+    profile_url: HttpUrl | None = None
     desirable: bool | None = None
     observed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -160,7 +161,7 @@ class ReviewEnrichmentResult(BaseModel):
     """Review lookup outcome, including unknown/error reasons for persistence."""
 
     status: str = Field(
-        pattern=r"^(matched|cached|unavailable|error|skipped|disabled)$"
+        pattern=r"^(matched|cached|unavailable|error|skipped|deferred|disabled)$"
     )
     stats: ReviewStats | None = None
     reason: str = Field(min_length=1, max_length=2000)

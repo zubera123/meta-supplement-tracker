@@ -202,6 +202,7 @@ class ScanRepository:
                 ),
                 business_unit_id=advertiser.trustpilot_business_unit_id,
                 matched_domain=advertiser.trustpilot_matched_domain,
+                profile_url=advertiser.latest_trustpilot_profile_url,
                 observed_at=(
                     advertiser.trustpilot_last_refreshed_at or advertiser.last_seen_at
                 ),
@@ -413,6 +414,13 @@ class ScanRepository:
                 if record.review_enrichment
                 else None
             ),
+            review_profile_url=(
+                str(record.review_enrichment.stats.profile_url)
+                if record.review_enrichment
+                and record.review_enrichment.stats
+                and record.review_enrichment.stats.profile_url
+                else None
+            ),
             review_desirable=(
                 record.review_enrichment.stats.desirable
                 if record.review_enrichment and record.review_enrichment.stats
@@ -432,7 +440,7 @@ class ScanRepository:
     @staticmethod
     def _update_review_cache(advertiser: Advertiser, record: AdRecord) -> None:
         result = record.review_enrichment
-        if result is None or result.status == "error":
+        if result is None or result.status in {"error", "deferred", "skipped"}:
             return
         stats = result.stats
         if stats is not None:
@@ -443,6 +451,9 @@ class ScanRepository:
             advertiser.latest_trustpilot_review_source = stats.source
             advertiser.latest_trustpilot_trust_score = stats.trust_score
             advertiser.latest_trustpilot_stars = stats.star_score
+            advertiser.latest_trustpilot_profile_url = (
+                str(stats.profile_url) if stats.profile_url else None
+            )
             return
         if result.refreshed_at is not None and result.attempted_domain is not None:
             if advertiser.trustpilot_matched_domain != result.attempted_domain:

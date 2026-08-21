@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Protocol
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -29,6 +30,12 @@ _TRANSIENT_STATUSES = frozenset({429, 500, 502, 503, 504})
 _APIFY_TERMINAL_STATUSES = frozenset(
     {"SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"}
 )
+
+
+class TrustpilotPaidLookupLimiter(Protocol):
+    def reserve_trustpilot_paid_lookup(
+        self, domain: str, daily_limit: int
+    ) -> tuple[bool, str]: ...
 
 
 class ReviewsProvider(ABC):
@@ -69,7 +76,7 @@ class UnconfiguredReviewsProvider(ReviewsProvider):
 
 
 class ApifyTrustpilotReviewsProvider(ReviewsProvider):
-    """Resolve one exact advertiser domain through an Apify business search."""
+    """Resolve one exact advertiser domain through a direct Trustpilot profile run."""
 
     def __init__(
         self,
@@ -77,6 +84,8 @@ class ApifyTrustpilotReviewsProvider(ReviewsProvider):
         api_token: str | None,
         actor_id: str = "automation-lab/trustpilot-scraper",
         max_total_charge_usd_per_run: float = 0.01,
+        max_unique_lookups_per_day: int = 10,
+        lookup_limiter: TrustpilotPaidLookupLimiter | None = None,
         minimum_desirable_reviews: int = 300,
         monthly_budget_gbp: float = 30.0,
         budget_gbp_per_usd: float = 1.0,
@@ -99,6 +108,10 @@ class ApifyTrustpilotReviewsProvider(ReviewsProvider):
             raise ProviderConfigurationError(
                 "APIFY_TRUSTPILOT_MAX_TOTAL_CHARGE_USD_PER_RUN must be greater than 0"
             )
+        if max_unique_lookups_per_day <= 0:
+            raise ProviderConfigurationError(
+                "TRUSTPILOT_MAX_UNIQUE_LOOKUPS_PER_DAY must be greater than 0"
+            )
         if monthly_budget_gbp <= 0 or budget_gbp_per_usd <= 0:
             raise ProviderConfigurationError(
                 "Apify budget and GBP-per-USD conversion must be positive"
@@ -117,6 +130,8 @@ class ApifyTrustpilotReviewsProvider(ReviewsProvider):
         self._actor_id = actor_id.strip()
         self._actor_ref = quote(self._actor_id.replace("/", "~"), safe="~")
         self._max_total_charge_usd_per_run = ceiling
+        self._max_unique_lookups_per_day = max_unique_lookups_per_day
+        self._lookup_limiter = lookup_limiter
         self._minimum_desirable_reviews = minimum_desirable_reviews
         self._monthly_budget_gbp = monthly_budget
         self._gbp_per_usd = gbp_per_usd
@@ -136,31 +151,57 @@ class ApifyTrustpilotReviewsProvider(ReviewsProvider):
     async def get_by_domain(
         self, domain: str, *, business_unit_id: str | None = None
     ) -> ReviewEnrichmentResult:
-        """Search only the supplied real domain and require an exact domain result."""
+        """Look up only the supplied real domain and require an exact result."""
 
         del business_unit_id  # Fresh caches avoid calls; this Actor searches by domain.
         normalized = normalize_domain(domain)
         if normalized is None:
             return unavailable_review("The supplied advertiser domain is invalid")
 
-        await self._guard_monthly_budget()
+        await self._check_monthly_budget()
+        if self._lookup_limiter is not None:
+            allowed, reason = self._lookup_limiter.reserve_trustpilot_paid_lookup(
+                normalized, self._max_unique_lookups_per_day
+            )
+            if not allowed:
+                logger.info(reason, extra={"domain": normalized})
+                return ReviewEnrichmentResult(
+                    status="deferred",
+                    reason=reason,
+                    attempted_domain=normalized,
+                )
+        # Reserve immediately before the single non-retried paid start. An
+        # ambiguous start response remains conservatively counted.
+        self._reserved_maximum_usd += self._max_total_charge_usd_per_run
         items = await self._run_actor_once(normalized)
         refreshed_at = datetime.now(UTC)
         if not items:
             return unavailable_review(
-                "Apify Trustpilot search returned no business for the supplied domain",
+                "Apify Trustpilot direct lookup returned no business for the supplied domain",
                 domain=normalized,
                 refreshed_at=refreshed_at,
             )
-        item = items[0]
-        if not isinstance(item, dict):
-            raise ProviderError("Apify Trustpilot dataset item is not an object")
-        stats = _parse_apify_business(
-            item,
-            expected_domain=normalized,
-            minimum_desirable_reviews=self._minimum_desirable_reviews,
-            observed_at=refreshed_at,
-        )
+        business_records = [
+            item
+            for item in items
+            if isinstance(item, dict) and item.get("type") == "business"
+        ]
+        if not business_records:
+            return unavailable_review(
+                "Apify Trustpilot direct lookup returned no business record",
+                domain=normalized,
+                refreshed_at=refreshed_at,
+            )
+        stats = None
+        for item in business_records:
+            stats = _parse_apify_business(
+                item,
+                expected_domain=normalized,
+                minimum_desirable_reviews=self._minimum_desirable_reviews,
+                observed_at=refreshed_at,
+            )
+            if stats is not None:
+                break
         if stats is None:
             return unavailable_review(
                 "Apify Trustpilot business result did not exactly match the supplied domain",
@@ -190,7 +231,7 @@ class ApifyTrustpilotReviewsProvider(ReviewsProvider):
         if self._owns_client:
             await self._client.aclose()
 
-    async def _guard_monthly_budget(self) -> None:
+    async def _check_monthly_budget(self) -> None:
         current_usage_usd = await self._get_monthly_usage_usd()
         projected_usd = (
             current_usage_usd
@@ -204,9 +245,6 @@ class ApifyTrustpilotReviewsProvider(ReviewsProvider):
                 "usage plus reserved review ceilings would exceed "
                 f"APIFY_MONTHLY_BUDGET_GBP={self._monthly_budget_gbp:.2f}"
             )
-        # Reserve before the paid start. A lost start response is ambiguous and must
-        # remain charged against this process's conservative budget projection.
-        self._reserved_maximum_usd += self._max_total_charge_usd_per_run
 
     async def _get_monthly_usage_usd(self) -> Decimal:
         payload = await self._get_json_object_with_retry(
@@ -225,13 +263,13 @@ class ApifyTrustpilotReviewsProvider(ReviewsProvider):
     async def _run_actor_once(self, domain: str) -> list[object]:
         endpoint = f"{APIFY_API_BASE_URL}/acts/{self._actor_ref}/runs"
         actor_input = {
-            "mode": "search",
-            "searchQueries": [domain],
+            "mode": "reviews",
+            "businessUrls": [domain],
             "maxResults": 1,
         }
         params = {
             "timeout": str(max(1, int(self._request_timeout_seconds))),
-            "maxItems": "1",
+            "maxItems": "2",
             "maxTotalChargeUsd": format(
                 self._max_total_charge_usd_per_run, "f"
             ),
@@ -272,10 +310,10 @@ class ApifyTrustpilotReviewsProvider(ReviewsProvider):
             params={
                 "clean": "true",
                 "format": "json",
-                "limit": "1",
+                "limit": "2",
                 "fields": (
-                    "type,businessId,name,domain,trustScore,stars,"
-                    "numberOfReviews,website,profileUrl"
+                    "type,businessId,domain,trustScore,stars,"
+                    "numberOfReviews,profileUrl"
                 ),
             },
         )
@@ -690,6 +728,22 @@ def _parse_apify_business(
         )
     trust_score = _apify_optional_score(payload.get("trustScore"), "trustScore")
     stars = _apify_optional_score(payload.get("stars"), "stars")
+    profile_url = payload.get("profileUrl")
+    if profile_url is not None and not isinstance(profile_url, str):
+        raise ProviderError("Apify Trustpilot business result has invalid profileUrl")
+    if isinstance(profile_url, str):
+        profile_parts = urlsplit(profile_url)
+        profile_host = (profile_parts.hostname or "").casefold()
+        if (
+            profile_parts.scheme not in {"http", "https"}
+            or not (
+                profile_host == "trustpilot.com"
+                or profile_host.endswith(".trustpilot.com")
+            )
+        ):
+            raise ProviderError(
+                "Apify Trustpilot business result has invalid profileUrl"
+            )
     return ReviewStats(
         source="Trustpilot via Apify",
         review_count=reviews,
@@ -698,6 +752,7 @@ def _parse_apify_business(
         star_score=stars,
         business_unit_id=business_id,
         matched_domain=expected_domain,
+        profile_url=profile_url,
         desirable=reviews >= minimum_desirable_reviews,
         observed_at=observed_at,
     )

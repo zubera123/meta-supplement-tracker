@@ -479,7 +479,11 @@ async def _run_scan_command(settings: Settings, *, require_full_outputs: bool) -
             else None
         )
         provider = _build_meta_provider(settings)
-        reviews = _build_reviews_provider(settings) if settings.reviews_enabled else None
+        reviews = (
+            _build_reviews_provider(settings, lookup_limiter=persistence)
+            if settings.reviews_enabled
+            else None
+        )
         result = await CandidatePipeline(
             settings=settings,
             meta_ads=provider,
@@ -601,7 +605,11 @@ def _build_sheets_provider(settings: Settings) -> GoogleSheetsProvider:
     )
 
 
-def _build_reviews_provider(settings: Settings) -> ReviewsProvider:
+def _build_reviews_provider(
+    settings: Settings,
+    *,
+    lookup_limiter: ScanPersistenceService | None = None,
+) -> ReviewsProvider:
     configured_provider = (
         settings.reviews_provider or "apify_trustpilot"
     ).casefold()
@@ -612,6 +620,10 @@ def _build_reviews_provider(settings: Settings) -> ReviewsProvider:
             max_total_charge_usd_per_run=(
                 settings.apify_trustpilot_max_total_charge_usd_per_run
             ),
+            max_unique_lookups_per_day=(
+                settings.trustpilot_max_unique_lookups_per_day
+            ),
+            lookup_limiter=lookup_limiter,
             minimum_desirable_reviews=settings.trustpilot_min_desirable_reviews,
             monthly_budget_gbp=settings.apify_monthly_budget_gbp,
             budget_gbp_per_usd=settings.apify_budget_gbp_per_usd,
