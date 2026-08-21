@@ -250,7 +250,17 @@ class CandidatePipeline:
             if self.persistence is not None and scan_run_id is not None:
                 # Every advertiser is persisted before output filters are applied.
                 self.persistence.persist_success(
-                    scan_run_id, records, relevance_results
+                    scan_run_id,
+                    records,
+                    relevance_results,
+                    minimum_followers=self.settings.target_min_instagram_followers,
+                    maximum_followers=self.settings.target_max_instagram_followers,
+                    disqualify_scans=self.settings.candidate_disqualify_scans,
+                    absent_days=self.settings.candidate_absent_days,
+                    scan_interval_hours=self.settings.scan_interval_hours,
+                    coverage_complete=getattr(
+                        self.meta_ads, "last_scan_coverage_complete", True
+                    ),
                 )
             await asyncio.sleep(0)
 
@@ -262,8 +272,14 @@ class CandidatePipeline:
                     maximum_followers=self.settings.target_max_instagram_followers,
                     relevance_results=relevance_results,
                 )
-                sheet_sync = self.sheets.sync_candidates(candidates, row_states)
+                removals = self.persistence.sheet_rows_to_remove()
+                sheet_sync = self.sheets.sync_candidates(
+                    candidates, row_states, removals
+                )
                 self.persistence.save_sheet_row_states(sheet_sync.row_states)
+                self.persistence.delete_sheet_row_states(
+                    sheet_sync.removed_company_ids
+                )
             await asyncio.sleep(0)
             ads_found = sum(len(record.ads) for record in records)
             candidates_written = (

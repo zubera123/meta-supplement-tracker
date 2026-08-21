@@ -45,9 +45,34 @@ class ScanRun(Base):
     ads_found: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     advertisers_found: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text)
+    coverage_complete: Mapped[bool] = mapped_column(default=True, nullable=False)
 
     observations: Mapped[list["AdvertiserObservation"]] = relationship(
         back_populates="scan_run", cascade="all, delete-orphan"
+    )
+
+
+class Company(Base):
+    """Canonical output identity; original Meta advertisers remain separate."""
+
+    __tablename__ = "companies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    canonical_domain: Mapped[str | None] = mapped_column(String(500), unique=True)
+    display_name: Mapped[str] = mapped_column(String(500), nullable=False)
+    regions: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consecutive_disqualifications: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    consecutive_absent_successful_scans: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    sheet_eligible: Mapped[bool] = mapped_column(default=False, nullable=False)
+    merged_into_company_id: Mapped[int | None] = mapped_column(
+        ForeignKey("companies.id", ondelete="SET NULL")
+    )
+
+    advertisers: Mapped[list["Advertiser"]] = relationship(back_populates="company")
+    sheet_row: Mapped["GoogleSheetRow | None"] = relationship(
+        back_populates="company", cascade="all, delete-orphan"
     )
 
 
@@ -59,6 +84,11 @@ class Advertiser(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    company_id: Mapped[int] = mapped_column(
+        ForeignKey("companies.id", ondelete="RESTRICT"), nullable=False
+    )
+    verified_landing_domain: Mapped[str | None] = mapped_column(String(500))
+    company_mapping_reason: Mapped[str] = mapped_column(String(500), nullable=False)
     meta_page_id: Mapped[str | None] = mapped_column(String(255))
     page_name: Mapped[str] = mapped_column(String(500), nullable=False)
     instagram_username: Mapped[str | None] = mapped_column(String(255))
@@ -85,9 +115,7 @@ class Advertiser(Base):
     observations: Mapped[list["AdvertiserObservation"]] = relationship(
         back_populates="advertiser", cascade="all, delete-orphan"
     )
-    sheet_row: Mapped["GoogleSheetRow | None"] = relationship(
-        back_populates="advertiser", cascade="all, delete-orphan"
-    )
+    company: Mapped[Company] = relationship(back_populates="advertisers")
 
 
 class Ad(Base):
@@ -158,18 +186,19 @@ class AdvertiserObservation(Base):
 
 
 class GoogleSheetRow(Base):
-    """PostgreSQL-only state used to update one visible row per advertiser."""
+    """Cached row location; developer metadata is the authoritative identity."""
 
     __tablename__ = "google_sheet_rows"
-    __table_args__ = (UniqueConstraint("advertiser_id"),)
+    __table_args__ = (UniqueConstraint("company_id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    advertiser_id: Mapped[int] = mapped_column(
-        ForeignKey("advertisers.id", ondelete="CASCADE"), nullable=False
+    company_id: Mapped[int] = mapped_column(
+        ForeignKey("companies.id", ondelete="CASCADE"), nullable=False
     )
     spreadsheet_id: Mapped[str] = mapped_column(String(255), nullable=False)
     sheet_tab: Mapped[str] = mapped_column(String(100), nullable=False)
     row_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    developer_metadata_id: Mapped[int | None] = mapped_column(Integer, unique=True)
     last_exported_first_seen: Mapped[date] = mapped_column(Date, nullable=False)
     last_exported_brand: Mapped[str] = mapped_column(String(500), nullable=False)
     last_exported_region: Mapped[str | None] = mapped_column(String(500))
@@ -181,4 +210,42 @@ class GoogleSheetRow(Base):
         DateTime(timezone=True), default=utc_now, nullable=False
     )
 
-    advertiser: Mapped[Advertiser] = relationship(back_populates="sheet_row")
+    company: Mapped[Company] = relationship(back_populates="sheet_row")
+
+
+class CompanyObservation(Base):
+    __tablename__ = "company_observations"
+    __table_args__ = (UniqueConstraint("company_id", "scan_run_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), nullable=False)
+    scan_run_id: Mapped[int] = mapped_column(ForeignKey("scan_runs.id"), nullable=False)
+    explicitly_disqualified: Mapped[bool | None] = mapped_column()
+    disqualification_reasons: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AdvertiserCompanyMapping(Base):
+    """Auditable history of conservative advertiser-to-company mappings."""
+
+    __tablename__ = "advertiser_company_mappings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    advertiser_id: Mapped[int] = mapped_column(ForeignKey("advertisers.id"), nullable=False)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), nullable=False)
+    scan_run_id: Mapped[int | None] = mapped_column(ForeignKey("scan_runs.id"))
+    verified_domain: Mapped[str | None] = mapped_column(String(500))
+    reason: Mapped[str] = mapped_column(String(500), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class CompanyCandidateEvent(Base):
+    __tablename__ = "company_candidate_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), nullable=False)
+    scan_run_id: Mapped[int | None] = mapped_column(ForeignKey("scan_runs.id"))
+    event_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

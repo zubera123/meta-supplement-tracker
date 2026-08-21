@@ -90,6 +90,8 @@ Settings are loaded from environment variables and, for local development, `.env
 | `DESIRABLE_TRUSTPILOT_REVIEW_COUNT` | `300`; legacy scorer setting |
 | `SCAN_INTERVAL_HOURS` | `12`; descriptive application setting—the Railway Cron expression controls production timing |
 | `SCAN_MAX_RUNTIME_SECONDS` | `2700`; 45-minute deadline for the complete `--run-once` pipeline |
+| `CANDIDATE_DISQUALIFY_SCANS` | `3`; consecutive successful complete observations required before removing an explicitly disqualified company from Sheets |
+| `CANDIDATE_ABSENT_DAYS` | `30`; successful complete scan-equivalent absence window before Sheet removal |
 | `PROVIDER_RETRY_ATTEMPTS` | `3` |
 | `DATABASE_URL` | Required only when persistence is enabled; reference Railway PostgreSQL's `DATABASE_URL` |
 | `PERSIST_SCAN_RESULTS` | `false`; must be `true` for the complete `--run-once` pipeline |
@@ -258,14 +260,27 @@ For the official provider, the check resolves Trustpilot's own documented domain
 
 ## Google Sheets candidate output
 
-Google Sheets output requires `PERSIST_SCAN_RESULTS=true`: PostgreSQL remains the source of stable advertiser identity, the original first-seen date, and the row mapping. The spreadsheet receives no hidden identity column, metadata tab, or second application-created tab. The complete `--run-once` command fails closed unless both persistence and Sheets output are enabled.
+Google Sheets output requires `PERSIST_SCAN_RESULTS=true`: PostgreSQL remains the source of canonical company identity, original first-seen date, lifecycle history, and a cached row location. The spreadsheet receives no visible identity column, metadata tab, or second application-created tab. Instead, every managed row receives project-visible Google Sheets developer metadata containing only its internal canonical-company integer ID. Google documents that row metadata follows its row through sorting, inserted rows, and moves, and is deleted with the row. The app searches that metadata on every synchronization; it never blindly trusts the cached physical row number.
 
 The configured tab contains exactly these visible columns:
 
 | First seen | Brand | Region | Instagram | Followers | Active ads | Spend est. | Spend source | Reviews | Review source |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 
-Only advertisers with a known Instagram follower count from 10,000 through 100,000 inclusive are written. Unknown, lower, and higher counts are excluded rather than guessed. `First seen` is the advertiser's original PostgreSQL date in `YYYY-MM-DD` format. Spend estimates update columns G–H. A successful review match writes its numeric count and either `Trustpilot via Apify` or `Trustpilot` to I–J. Missing or failed review enrichment leaves those cells unchanged, preserving an earlier valid value. No visible columns are added. Unknown spend is written explicitly as `Unknown`. Writes are batched, duplicate input advertisers are collapsed by PostgreSQL ID, and transient HTTP 429/5xx responses use bounded exponential retries.
+Only companies with a known Instagram follower count from 10,000 through 100,000 inclusive are written. Unknown, lower, and higher counts are excluded rather than guessed. `First seen` is the company's earliest original advertiser date in PostgreSQL. Spend estimates update columns G–H. A successful review match writes its numeric count and either `Trustpilot via Apify` or `Trustpilot` to I–J. Missing or failed review enrichment leaves those cells unchanged, preserving an earlier valid value. No visible columns are added. Unknown spend is written explicitly as `Unknown`. Writes are batched, duplicate input companies are collapsed by canonical ID, and transient HTTP 429/5xx responses use bounded exponential retries.
+
+### Company identity and stale-row policy
+
+Meta Page ID remains the primary advertiser identity and every original page, ad, and observation is preserved. Separate pages group into one canonical output company only when their real ad destinations resolve to the exact same normalized registrable domain. Normalization lowercases IDNA hostnames, removes scheme, `www`, ports, path, query, and fragment, and uses an offline bundled Public Suffix List snapshot so domains such as `shop.example.co.uk` become `example.co.uk` without a runtime network fetch. Conflicting destinations, missing destinations, IPs, Meta/Instagram links, and known redirect/link-shortener domains do not merge. Names and Instagram similarity are never company keys. PostgreSQL stores the current verified mapping, canonical domain, and mapping history; a later conflicting destination does not silently move an established Page identity.
+
+Grouped output uses the earliest first-seen date, unique ad IDs across the pages, their real region union, and the most recent current valid Instagram identity. It selects the strongest existing spend evidence without summing page estimates, which avoids double-counting overlapping audiences, and uses the latest real review result. All underlying page-level records remain queryable.
+
+An existing Sheet row is removed only after one of these conservative rules:
+
+- `CANDIDATE_DISQUALIFY_SCANS` consecutive successful, uncapped observations explicitly show irrelevance, followers outside 10,000–100,000, or a reliable impressions/reach spend result outside the target.
+- `CANDIDATE_ABSENT_DAYS` is converted to successful complete scan equivalents using `SCAN_INTERVAL_HOURS`; at the defaults, 30 days requires 60 relevant-region scans in which the company is absent.
+
+Unknown follower/spend data and mere absence in one scan are not explicit failures. Activity-model spend never disqualifies. Failed, aborted, capped, and unrelated-region scans do not advance either counter. Removal affects only the visible Sheet row; advertisers, companies, ads, observations, mappings, and qualification/removal events remain in PostgreSQL. A later qualifying observation recreates the row with the original `First seen`. The first successful post-migration sync reconciles existing visible rows through their stored visible identity, attaches developer metadata in place, and does not append duplicates.
 
 ### Google Cloud and spreadsheet setup
 
@@ -300,7 +315,7 @@ The check creates only the configured `Candidates` tab and its exact header when
 
 For local use, put the same four variables in the untracked `.env` file and run `python -m app.jobs.brand_scan --check-sheets`. If access is denied, confirm that the Sheets API is enabled in the credential's project and that the spreadsheet—not merely a similarly named Drive file—was shared with the exact service-account email as Editor.
 
-The implementation uses the documented Sheets API v4 [spreadsheet structure updates](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets/batchUpdate) and [values batch updates](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values/batchUpdate). Its retry policy follows Google's [Sheets API quota guidance](https://developers.google.com/workspace/sheets/api/limits): rate limits and transient server responses use bounded exponential backoff.
+The implementation uses the documented Sheets API v4 [developer metadata behavior](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.developerMetadata), [metadata search guide](https://developers.google.com/workspace/sheets/api/guides/metadata), [spreadsheet structure updates](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets/batchUpdate), and [values batch updates](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values/batchUpdate). Its retry policy follows Google's [Sheets API quota guidance](https://developers.google.com/workspace/sheets/api/limits): rate limits and transient server responses use bounded exponential backoff.
 
 ### Run the complete pipeline once
 

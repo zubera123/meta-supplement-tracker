@@ -263,10 +263,10 @@ def test_sheet_row_mapping_is_upserted_by_stable_advertiser_identity(
     candidates, _ = service.prepare_sheet_candidates(
         [record], minimum_followers=10_000, maximum_followers=100_000
     )
-    advertiser_id = candidates[0].advertiser_id
+    company_id = candidates[0].company_id
 
     state = SheetRowState(
-        advertiser_id=advertiser_id,
+        company_id=company_id,
         spreadsheet_id="sheet-id",
         sheet_tab="Candidates",
         row_number=2,

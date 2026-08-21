@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db.models import (
@@ -11,8 +11,11 @@ from app.db.models import (
     AdvertiserObservation,
     GoogleSheetRow,
     ScanRun,
+    Company,
+    AdvertiserCompanyMapping,
     utc_now,
 )
+from app.services.company_identity import resolve_verified_company_domain
 from app.models import (
     AdRecord,
     MetaAdDetails,
@@ -72,7 +75,9 @@ class ScanRepository:
         scan_run.error_message = error_message[:4000]
         return scan_run
 
-    def upsert_advertiser(self, record: AdRecord) -> Advertiser:
+    def upsert_advertiser(
+        self, record: AdRecord, *, scan_run_id: int | None = None
+    ) -> Advertiser:
         page_id = record.brand.source_id
         advertiser = self.find_advertiser(record)
 
@@ -82,8 +87,27 @@ class ScanRepository:
             social.instagram_handle if social and social.instagram_handle
             else record.brand.instagram_handle
         )
+        resolution = resolve_verified_company_domain(record)
         if advertiser is None:
+            company = None
+            if resolution.domain:
+                company = self.session.scalar(
+                    select(Company).where(Company.canonical_domain == resolution.domain)
+                )
+            if company is None:
+                company = Company(
+                    canonical_domain=resolution.domain,
+                    display_name=record.brand.name,
+                    regions=[r.value for r in (record.regions or [record.region])],
+                    first_seen_at=record.observed_at,
+                    last_seen_at=record.observed_at,
+                )
+                self.session.add(company)
+                self.session.flush()
             advertiser = Advertiser(
+                company_id=company.id,
+                verified_landing_domain=resolution.domain,
+                company_mapping_reason=resolution.reason,
                 meta_page_id=page_id,
                 page_name=record.brand.name,
                 instagram_username=username,
@@ -93,8 +117,55 @@ class ScanRepository:
             )
             self.session.add(advertiser)
             self.session.flush()
+            self.session.add(AdvertiserCompanyMapping(
+                advertiser_id=advertiser.id, company_id=company.id,
+                scan_run_id=scan_run_id, verified_domain=resolution.domain,
+                reason=resolution.reason, started_at=record.observed_at,
+            ))
             self._update_review_cache(advertiser, record)
             return advertiser
+
+        if resolution.domain:
+            target = self.session.scalar(
+                select(Company).where(Company.canonical_domain == resolution.domain)
+            )
+            current = self.session.get(Company, advertiser.company_id)
+            if (
+                current is not None
+                and current.canonical_domain is not None
+                and current.canonical_domain != resolution.domain
+            ):
+                advertiser.company_mapping_reason = (
+                    "verified destination changed; existing Page identity preserved"
+                )
+                target = current
+            if target is None and current is not None and current.canonical_domain is None:
+                current.canonical_domain = resolution.domain
+                target = current
+            if target is not None and target.id != advertiser.company_id:
+                prior = self.session.scalar(
+                    select(AdvertiserCompanyMapping)
+                    .where(AdvertiserCompanyMapping.advertiser_id == advertiser.id)
+                    .where(AdvertiserCompanyMapping.ended_at.is_(None))
+                )
+                if prior is not None:
+                    prior.ended_at = record.observed_at
+                current_count = self.session.scalar(
+                    select(func.count()).select_from(Advertiser).where(
+                        Advertiser.company_id == advertiser.company_id
+                    )
+                )
+                if current is not None and current_count == 1:
+                    current.merged_into_company_id = target.id
+                advertiser.company_id = target.id
+                self.session.add(AdvertiserCompanyMapping(
+                    advertiser_id=advertiser.id, company_id=target.id,
+                    scan_run_id=scan_run_id, verified_domain=resolution.domain,
+                    reason=resolution.reason, started_at=record.observed_at,
+                ))
+            if target is not current or current is None or current.canonical_domain == resolution.domain:
+                advertiser.verified_landing_domain = resolution.domain
+                advertiser.company_mapping_reason = resolution.reason
 
         advertiser.page_name = record.brand.name
         if username is not None:
@@ -148,29 +219,33 @@ class ScanRepository:
             return self.session.scalar(
                 select(Advertiser).where(Advertiser.meta_page_id == page_id)
             )
-        return self.session.scalar(
-            select(Advertiser)
-            .where(Advertiser.meta_page_id.is_(None))
-            .where(Advertiser.page_name == record.brand.name)
-            .limit(1)
-        )
+        domain = resolve_verified_company_domain(record).domain
+        if domain:
+            return self.session.scalar(
+                select(Advertiser)
+                .where(Advertiser.meta_page_id.is_(None))
+                .where(Advertiser.verified_landing_domain == domain)
+                .limit(1)
+            )
+        return None
 
     def sheet_row_states(
-        self, advertiser_ids: list[int]
+        self, company_ids: list[int]
     ) -> dict[int, SheetRowState]:
-        if not advertiser_ids:
+        if not company_ids:
             return {}
         rows = self.session.scalars(
             select(GoogleSheetRow).where(
-                GoogleSheetRow.advertiser_id.in_(advertiser_ids)
+                GoogleSheetRow.company_id.in_(company_ids)
             )
         ).all()
         return {
-            row.advertiser_id: SheetRowState(
-                advertiser_id=row.advertiser_id,
+            row.company_id: SheetRowState(
+                company_id=row.company_id,
                 spreadsheet_id=row.spreadsheet_id,
                 sheet_tab=row.sheet_tab,
                 row_number=row.row_number,
+                developer_metadata_id=row.developer_metadata_id,
                 last_exported_first_seen=row.last_exported_first_seen,
                 last_exported_brand=row.last_exported_brand,
                 last_exported_region=row.last_exported_region,
@@ -182,7 +257,7 @@ class ScanRepository:
     def upsert_sheet_row_state(self, state: SheetRowState) -> GoogleSheetRow:
         row = self.session.scalar(
             select(GoogleSheetRow).where(
-                GoogleSheetRow.advertiser_id == state.advertiser_id
+                GoogleSheetRow.company_id == state.company_id
             )
         )
         now = utc_now()
@@ -197,6 +272,7 @@ class ScanRepository:
         row.spreadsheet_id = state.spreadsheet_id
         row.sheet_tab = state.sheet_tab
         row.row_number = state.row_number
+        row.developer_metadata_id = state.developer_metadata_id
         row.last_exported_first_seen = state.last_exported_first_seen
         row.last_exported_brand = state.last_exported_brand
         row.last_exported_region = state.last_exported_region

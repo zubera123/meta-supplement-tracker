@@ -49,6 +49,8 @@ class SheetSyncResult:
     updated: int
     excluded: int
     row_states: tuple[SheetRowState, ...]
+    removed: int = 0
+    removed_company_ids: tuple[int, ...] = ()
 
 
 class SheetsApi(Protocol):
@@ -66,6 +68,10 @@ class SheetsApi(Protocol):
 
     def batch_update_values(
         self, spreadsheet_id: str, data: list[dict[str, Any]]
+    ) -> dict[str, Any]: ...
+
+    def search_developer_metadata(
+        self, spreadsheet_id: str, body: dict[str, Any]
     ) -> dict[str, Any]: ...
 
 
@@ -200,6 +206,16 @@ class GoogleSheetsApiClient:
             "batch write sheet values",
         )
 
+    def search_developer_metadata(
+        self, spreadsheet_id: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._execute(
+            lambda: self._service.spreadsheets().developerMetadata().search(
+                spreadsheetId=spreadsheet_id, body=body
+            ),
+            "search developer metadata",
+        )
+
     def _execute(self, request_factory: Callable[[], Any], operation: str) -> dict[str, Any]:
         for attempt in range(1, self._retry_attempts + 1):
             try:
@@ -298,11 +314,16 @@ class GoogleSheetsProvider:
         self,
         candidates: Sequence[SheetCandidate],
         row_states: Mapping[int, SheetRowState],
+        removals: Mapping[int, SheetRowState] | None = None,
     ) -> SheetSyncResult:
         sheet_info = self._sheet_info or self.ensure_ready()
-        unique_candidates = {item.advertiser_id: item for item in candidates}
+        unique_candidates = {item.company_id: item for item in candidates}
         excluded = len(candidates) - len(unique_candidates)
-        if not unique_candidates:
+        removals = {
+            key: value for key, value in (removals or {}).items()
+            if key not in unique_candidates
+        }
+        if not unique_candidates and not removals:
             return SheetSyncResult(0, 0, excluded, ())
 
         all_range = f"{_a1_tab(self._sheet_tab)}!A:J"
@@ -322,23 +343,22 @@ class GoogleSheetsProvider:
         next_row = max(2, len(rows) + 1)
         appended = 0
         updated = 0
+        metadata = self._metadata_rows(sheet_info.sheet_id)
 
         for candidate in unique_candidates.values():
-            state = row_states.get(candidate.advertiser_id)
-            row_number = _resolve_existing_row(
-                rows,
-                candidate,
-                state,
-                spreadsheet_id=self._spreadsheet_id,
+            state = row_states.get(candidate.company_id)
+            located = metadata.get(candidate.company_id)
+            row_number = located[1] if located else _resolve_existing_row(
+                rows, candidate, state, spreadsheet_id=self._spreadsheet_id,
                 sheet_tab=self._sheet_tab,
             )
             if row_number is not None:
                 owner = assigned_rows.get(row_number)
-                if owner is not None and owner != candidate.advertiser_id:
+                if owner is not None and owner != candidate.company_id:
                     raise ProviderError(
                         "Two PostgreSQL advertisers resolve to the same visible Sheet row"
                     )
-                assigned_rows[row_number] = candidate.advertiser_id
+                assigned_rows[row_number] = candidate.company_id
                 existing = rows[row_number - 1]
                 visible = _visible_values(candidate, existing)
                 if _has_review_update(candidate):
@@ -358,7 +378,7 @@ class GoogleSheetsProvider:
             else:
                 row_number = next_row
                 next_row += 1
-                assigned_rows[row_number] = candidate.advertiser_id
+                assigned_rows[row_number] = candidate.company_id
                 visible = _visible_values(candidate, None)
                 updates.append(
                     {
@@ -369,12 +389,16 @@ class GoogleSheetsProvider:
                 rows.append(visible)
                 appended += 1
 
+            metadata_id = located[0] if located else self._attach_metadata(
+                sheet_info.sheet_id, candidate.company_id, row_number
+            )
             new_states.append(
                 SheetRowState(
-                    advertiser_id=candidate.advertiser_id,
+                    company_id=candidate.company_id,
                     spreadsheet_id=self._spreadsheet_id,
                     sheet_tab=self._sheet_tab,
                     row_number=row_number,
+                    developer_metadata_id=metadata_id,
                     last_exported_first_seen=candidate.first_seen,
                     last_exported_brand=candidate.brand,
                     last_exported_region=str(visible[2]) or None,
@@ -400,13 +424,88 @@ class GoogleSheetsProvider:
             )
             self._sheet_info = SheetInfo(sheet_info.sheet_id, required_rows)
 
-        self._api.batch_update_values(self._spreadsheet_id, updates)
+        if updates:
+            self._api.batch_update_values(self._spreadsheet_id, updates)
+        delete_rows: list[tuple[int, int]] = []
+        removed_ids: list[int] = []
+        for company_id, state in removals.items():
+            removed_ids.append(company_id)
+            located = metadata.get(company_id)
+            row_number = located[1] if located else _resolve_state_row(
+                rows, state, spreadsheet_id=self._spreadsheet_id, sheet_tab=self._sheet_tab
+            )
+            if row_number is None:
+                continue
+            if row_number in assigned_rows:
+                raise ProviderError(
+                    "A stale company and an active company resolve to the same Sheet row; "
+                    "no row was deleted"
+                )
+            if located is None:
+                self._attach_metadata(sheet_info.sheet_id, company_id, row_number)
+            delete_rows.append((row_number, company_id))
+        if delete_rows:
+            self._api.batch_update_spreadsheet(
+                self._spreadsheet_id,
+                {"requests": [{"deleteDimension": {"range": {
+                    "sheetId": sheet_info.sheet_id, "dimension": "ROWS",
+                    "startIndex": row - 1, "endIndex": row,
+                }}} for row, _ in sorted(delete_rows, reverse=True)]},
+            )
+            deleted_numbers = [row for row, _ in delete_rows]
+            new_states = [state.model_copy(update={
+                "row_number": state.row_number - sum(row < state.row_number for row in deleted_numbers)
+            }) for state in new_states]
         return SheetSyncResult(
             appended=appended,
             updated=updated,
             excluded=excluded,
             row_states=tuple(new_states),
+            removed=len(removed_ids),
+            removed_company_ids=tuple(removed_ids),
         )
+
+    def _metadata_rows(self, sheet_id: int) -> dict[int, tuple[int, int]]:
+        response = self._api.search_developer_metadata(
+            self._spreadsheet_id,
+            {"dataFilters": [{"developerMetadataLookup": {
+                "metadataKey": "meta_supplement_tracker_company_id",
+                "visibility": "PROJECT",
+            }}]},
+        )
+        result: dict[int, tuple[int, int]] = {}
+        for item in response.get("matchedDeveloperMetadata", []):
+            metadata = item.get("developerMetadata", {})
+            location = metadata.get("location", {}).get("dimensionRange", {})
+            if location.get("sheetId") != sheet_id or location.get("dimension") != "ROWS":
+                continue
+            try:
+                company_id = int(metadata["metadataValue"])
+                metadata_id = int(metadata["metadataId"])
+                row_number = int(location["startIndex"]) + 1
+            except (KeyError, TypeError, ValueError):
+                raise ProviderError("Google Sheets returned malformed company metadata")
+            if company_id in result:
+                raise ProviderError("Duplicate developer metadata exists for one company")
+            result[company_id] = (metadata_id, row_number)
+        return result
+
+    def _attach_metadata(self, sheet_id: int, company_id: int, row_number: int) -> int:
+        response = self._api.batch_update_spreadsheet(
+            self._spreadsheet_id,
+            {"requests": [{"createDeveloperMetadata": {"developerMetadata": {
+                "metadataKey": "meta_supplement_tracker_company_id",
+                "metadataValue": str(company_id), "visibility": "PROJECT",
+                "location": {"dimensionRange": {
+                    "sheetId": sheet_id, "dimension": "ROWS",
+                    "startIndex": row_number - 1, "endIndex": row_number,
+                }},
+            }}}]},
+        )
+        try:
+            return int(response["replies"][0]["createDeveloperMetadata"]["developerMetadata"]["metadataId"])
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise ProviderError("Google Sheets did not return created developer metadata") from exc
 
 
 def _find_sheet(spreadsheet: dict[str, Any], title: str) -> SheetInfo | None:
@@ -476,6 +575,23 @@ def _resolve_existing_row(
             "The Candidates tab already contains duplicate rows for a qualifying advertiser"
         )
     return matches[0] if matches else None
+
+
+def _resolve_state_row(
+    rows: list[list[object]], state: SheetRowState, *, spreadsheet_id: str, sheet_tab: str
+) -> int | None:
+    if state.spreadsheet_id != spreadsheet_id or state.sheet_tab != sheet_tab:
+        raise ProviderError("A stale row mapping belongs to a different spreadsheet or tab")
+    matches = [
+        number for number, row in enumerate(rows[1:], start=2) if _matches_state(row, state)
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise ProviderError(
+            "A stale Google Sheet row could not be reconciled safely; no row was deleted"
+        )
+    return matches[0]
 
 
 def _matches_state(row: list[object], state: SheetRowState) -> bool:

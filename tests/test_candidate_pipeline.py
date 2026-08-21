@@ -57,6 +57,12 @@ class MemorySheetsApi:
     def batch_update_spreadsheet(
         self, spreadsheet_id: str, body: dict[str, Any]
     ) -> dict[str, Any]:
+        request = body["requests"][0]
+        if "createDeveloperMetadata" in request:
+            item = request["createDeveloperMetadata"]["developerMetadata"]
+            return {"replies": [{"createDeveloperMetadata": {"developerMetadata": {
+                **item, "metadataId": int(item["metadataValue"]),
+            }}}]}
         return {"replies": [{}]}
 
     def get_values(self, spreadsheet_id: str, range_name: str) -> dict[str, Any]:
@@ -84,12 +90,17 @@ class MemorySheetsApi:
             self.rows[row_number - 1] = existing
         return {"totalUpdatedRows": len(data)}
 
+    def search_developer_metadata(
+        self, spreadsheet_id: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {"matchedDeveloperMetadata": []}
+
 
 class FailingSheetsProvider:
     def ensure_ready(self) -> None:
         return None
 
-    def sync_candidates(self, candidates: object, row_states: object) -> object:
+    def sync_candidates(self, candidates: object, row_states: object, removals: object = None) -> object:
         raise ProviderError("Google Sheets write failed")
 
 

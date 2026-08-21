@@ -65,6 +65,8 @@ class Settings(BaseSettings):
     desirable_trustpilot_review_count: int = Field(default=300, ge=0)
     scan_interval_hours: int = Field(default=12, ge=1)
     scan_max_runtime_seconds: float = Field(default=2700.0, gt=0, le=86_400)
+    candidate_disqualify_scans: int = Field(default=3, ge=1, le=100)
+    candidate_absent_days: int = Field(default=30, ge=1, le=3650)
     provider_retry_attempts: int = Field(default=3, ge=1, le=10)
     provider_retry_min_wait_seconds: float = Field(default=1.0, ge=0)
     provider_retry_max_wait_seconds: float = Field(default=10.0, ge=0)

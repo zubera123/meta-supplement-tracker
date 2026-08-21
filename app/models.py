@@ -192,7 +192,7 @@ class BrandCandidate(BaseModel):
 class SheetCandidate(BaseModel):
     """A qualifying advertiser prepared from PostgreSQL for Sheet output."""
 
-    advertiser_id: int = Field(gt=0)
+    company_id: int = Field(gt=0)
     first_seen: date
     brand: str = Field(min_length=1)
     region: str = Field(min_length=1)
@@ -206,12 +206,13 @@ class SheetCandidate(BaseModel):
 
 
 class SheetRowState(BaseModel):
-    """PostgreSQL-only mapping between an advertiser and its visible Sheet row."""
+    """PostgreSQL-only cache for a metadata-identified company Sheet row."""
 
-    advertiser_id: int = Field(gt=0)
+    company_id: int = Field(gt=0)
     spreadsheet_id: str = Field(min_length=1)
     sheet_tab: str = Field(min_length=1)
     row_number: int = Field(ge=2)
+    developer_metadata_id: int | None = Field(default=None, gt=0)
     last_exported_first_seen: date
     last_exported_brand: str = Field(min_length=1)
     last_exported_region: str | None = None

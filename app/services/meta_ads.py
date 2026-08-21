@@ -210,6 +210,7 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
         self._retry_min_wait_seconds = retry_min_wait_seconds
         self._retry_max_wait_seconds = retry_max_wait_seconds
         self._client = client
+        self.last_scan_coverage_complete = True
 
     async def retrieve_advertisers(
         self, *, regions: Sequence[str], categories: Sequence[str]
@@ -351,12 +352,15 @@ class ApifyMetaAdsProvider(MetaAdsProvider):
         )
 
         ads_by_id: dict[str, MetaAdDetails] = {}
+        self.last_scan_coverage_complete = True
         for region, country in country_queries:
             raw_items = await self._run_actor(
                 client,
                 country=country,
                 keywords=keywords,
             )
+            if len(raw_items) >= self._max_results:
+                self.last_scan_coverage_complete = False
             for index, item in enumerate(raw_items):
                 if not isinstance(item, dict):
                     logger.warning(

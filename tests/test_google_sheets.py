@@ -48,7 +48,7 @@ def candidate(
     active_ads: int = 3,
 ) -> SheetCandidate:
     return SheetCandidate(
-        advertiser_id=advertiser_id,
+        company_id=advertiser_id,
         first_seen=first_seen,
         brand=brand,
         region=region,
@@ -66,7 +66,7 @@ def row_state(
     instagram: str | None = "@example_supplements",
 ) -> SheetRowState:
     return SheetRowState(
-        advertiser_id=advertiser_id,
+        company_id=advertiser_id,
         spreadsheet_id=SPREADSHEET_ID,
         sheet_tab=TAB,
         row_number=row_number,
@@ -91,6 +91,8 @@ class FakeSheetsApi:
         self.structure_updates: list[dict[str, Any]] = []
         self.value_updates: list[tuple[str, list[list[object]]]] = []
         self.batch_value_updates: list[list[dict[str, Any]]] = []
+        self.metadata: dict[int, tuple[int, int]] = {}
+        self.next_metadata_id = 1
 
     def get_spreadsheet(self, spreadsheet_id: str) -> dict[str, Any]:
         assert spreadsheet_id == SPREADSHEET_ID
@@ -129,6 +131,22 @@ class FakeSheetsApi:
                     }
                 ]
             }
+        if "createDeveloperMetadata" in request:
+            item = request["createDeveloperMetadata"]["developerMetadata"]
+            metadata_id = self.next_metadata_id
+            self.next_metadata_id += 1
+            row = item["location"]["dimensionRange"]["startIndex"] + 1
+            self.metadata[int(item["metadataValue"])] = (metadata_id, row)
+            return {"replies": [{"createDeveloperMetadata": {"developerMetadata": {
+                **item, "metadataId": metadata_id,
+            }}}]}
+        if "deleteDimension" in request:
+            for operation in body["requests"]:
+                start = operation["deleteDimension"]["range"]["startIndex"]
+                self.rows.pop(start)
+                self.metadata = {key: (mid, row - 1 if row > start + 1 else row)
+                                 for key, (mid, row) in self.metadata.items() if row != start + 1}
+            return {"replies": [{} for _ in body["requests"]]}
         append = request["appendDimension"]
         self.row_count += append["length"]
         return {"replies": [{}]}
@@ -168,6 +186,17 @@ class FakeSheetsApi:
             existing[:width] = incoming
             self.rows[row_number - 1] = existing
         return {"totalUpdatedRows": len(data)}
+
+    def search_developer_metadata(
+        self, spreadsheet_id: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {"matchedDeveloperMetadata": [{"developerMetadata": {
+            "metadataId": metadata_id,
+            "metadataKey": "meta_supplement_tracker_company_id",
+            "metadataValue": str(company_id), "visibility": "PROJECT",
+            "location": {"dimensionRange": {"sheetId": 7, "dimension": "ROWS",
+                "startIndex": row - 1, "endIndex": row}},
+        }} for company_id, (metadata_id, row) in self.metadata.items()]}
 
 
 def provider(api: FakeSheetsApi) -> GoogleSheetsProvider:
@@ -281,6 +310,7 @@ def test_existing_advertiser_updates_without_duplicate() -> None:
     assert result.appended == 0
     assert len(api.rows) == 2
     assert api.rows[1][4:6] == [30_000, 5]
+    assert api.metadata[1][1] == 2
 
 
 def test_repeated_candidate_input_is_deduplicated() -> None:
@@ -472,3 +502,39 @@ def test_check_sheets_only_verifies_sheet_access(monkeypatch, capsys) -> None:
         "headers": "ready",
         "write_access": "verified",
     }
+
+
+def test_developer_metadata_follows_manual_sort_and_updates_correct_company() -> None:
+    api = FakeSheetsApi(rows=[list(SHEET_HEADERS)])
+    sheets = provider(api)
+    first = candidate(advertiser_id=1, brand="One", instagram="one")
+    second = candidate(advertiser_id=2, brand="Two", instagram="two")
+    result = sheets.sync_candidates([first, second], {})
+    api.rows[1], api.rows[2] = api.rows[2], api.rows[1]
+    api.metadata[1] = (api.metadata[1][0], 3)
+    api.metadata[2] = (api.metadata[2][0], 2)
+
+    changed = first.model_copy(update={"followers": 77_000})
+    sheets.sync_candidates(
+        [changed], {state.company_id: state for state in result.row_states}
+    )
+
+    assert api.rows[2][1] == "One"
+    assert api.rows[2][4] == 77_000
+    assert api.rows[1][1] == "Two"
+
+
+def test_stale_deletion_uses_invisible_metadata_after_inserted_row() -> None:
+    api = FakeSheetsApi(rows=[list(SHEET_HEADERS)])
+    sheets = provider(api)
+    result = sheets.sync_candidates([candidate()], {})
+    state = result.row_states[0]
+    api.rows.insert(1, ["manual"] + [""] * 9)
+    api.metadata[1] = (api.metadata[1][0], 3)
+
+    removed = sheets.sync_candidates([], {}, {1: state})
+
+    assert removed.removed_company_ids == (1,)
+    assert len(api.rows) == 2
+    assert api.rows[1][0] == "manual"
+    assert 1 not in api.metadata
