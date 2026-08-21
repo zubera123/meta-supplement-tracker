@@ -5,8 +5,15 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.models import Ad, Advertiser, AdvertiserObservation, ScanRun, utc_now
-from app.models import AdRecord, MetaAdDetails
+from app.db.models import (
+    Ad,
+    Advertiser,
+    AdvertiserObservation,
+    GoogleSheetRow,
+    ScanRun,
+    utc_now,
+)
+from app.models import AdRecord, MetaAdDetails, SheetRowState
 
 
 class ScanRepository:
@@ -60,18 +67,7 @@ class ScanRepository:
 
     def upsert_advertiser(self, record: AdRecord) -> Advertiser:
         page_id = record.brand.source_id
-        advertiser: Advertiser | None = None
-        if page_id:
-            advertiser = self.session.scalar(
-                select(Advertiser).where(Advertiser.meta_page_id == page_id)
-            )
-        else:
-            advertiser = self.session.scalar(
-                select(Advertiser)
-                .where(Advertiser.meta_page_id.is_(None))
-                .where(Advertiser.page_name == record.brand.name)
-                .limit(1)
-            )
+        advertiser = self.find_advertiser(record)
 
         social = record.social_stats
         followers = social.instagram_followers if social else None
@@ -98,6 +94,68 @@ class ScanRepository:
         advertiser.latest_instagram_followers = followers
         advertiser.last_seen_at = record.observed_at
         return advertiser
+
+    def find_advertiser(self, record: AdRecord) -> Advertiser | None:
+        page_id = record.brand.source_id
+        if page_id:
+            return self.session.scalar(
+                select(Advertiser).where(Advertiser.meta_page_id == page_id)
+            )
+        return self.session.scalar(
+            select(Advertiser)
+            .where(Advertiser.meta_page_id.is_(None))
+            .where(Advertiser.page_name == record.brand.name)
+            .limit(1)
+        )
+
+    def sheet_row_states(
+        self, advertiser_ids: list[int]
+    ) -> dict[int, SheetRowState]:
+        if not advertiser_ids:
+            return {}
+        rows = self.session.scalars(
+            select(GoogleSheetRow).where(
+                GoogleSheetRow.advertiser_id.in_(advertiser_ids)
+            )
+        ).all()
+        return {
+            row.advertiser_id: SheetRowState(
+                advertiser_id=row.advertiser_id,
+                spreadsheet_id=row.spreadsheet_id,
+                sheet_tab=row.sheet_tab,
+                row_number=row.row_number,
+                last_exported_first_seen=row.last_exported_first_seen,
+                last_exported_brand=row.last_exported_brand,
+                last_exported_region=row.last_exported_region,
+                last_exported_instagram=row.last_exported_instagram,
+            )
+            for row in rows
+        }
+
+    def upsert_sheet_row_state(self, state: SheetRowState) -> GoogleSheetRow:
+        row = self.session.scalar(
+            select(GoogleSheetRow).where(
+                GoogleSheetRow.advertiser_id == state.advertiser_id
+            )
+        )
+        now = utc_now()
+        if row is None:
+            row = GoogleSheetRow(
+                **state.model_dump(),
+                created_at=now,
+                updated_at=now,
+            )
+            self.session.add(row)
+            return row
+        row.spreadsheet_id = state.spreadsheet_id
+        row.sheet_tab = state.sheet_tab
+        row.row_number = state.row_number
+        row.last_exported_first_seen = state.last_exported_first_seen
+        row.last_exported_brand = state.last_exported_brand
+        row.last_exported_region = state.last_exported_region
+        row.last_exported_instagram = state.last_exported_instagram
+        row.updated_at = now
+        return row
 
     def upsert_ad(
         self, advertiser: Advertiser, ad_details: MetaAdDetails, *, seen_at: datetime

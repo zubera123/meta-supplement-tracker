@@ -58,8 +58,10 @@ class Settings(BaseSettings):
     apify_monthly_budget_gbp: float = Field(default=30.0, gt=0)
     apify_budget_gbp_per_usd: float = Field(default=1.0, gt=0)
     apify_request_timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
+    google_sheets_enabled: bool = False
+    google_sheet_id: str | None = None
+    google_sheet_tab: str = Field(default="Candidates", min_length=1, max_length=100)
     google_service_account_json: str | None = None
-    google_doc_id: str | None = None
     instagram_provider: str | None = None
     instagram_api_key: str | None = None
     reviews_provider: str | None = None

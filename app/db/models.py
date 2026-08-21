@@ -1,9 +1,10 @@
 """SQLAlchemy models for durable scan history."""
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from sqlalchemy import (
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -74,6 +75,9 @@ class Advertiser(Base):
     observations: Mapped[list["AdvertiserObservation"]] = relationship(
         back_populates="advertiser", cascade="all, delete-orphan"
     )
+    sheet_row: Mapped["GoogleSheetRow | None"] = relationship(
+        back_populates="advertiser", cascade="all, delete-orphan"
+    )
 
 
 class Ad(Base):
@@ -120,3 +124,30 @@ class AdvertiserObservation(Base):
 
     advertiser: Mapped[Advertiser] = relationship(back_populates="observations")
     scan_run: Mapped[ScanRun] = relationship(back_populates="observations")
+
+
+class GoogleSheetRow(Base):
+    """PostgreSQL-only state used to update one visible row per advertiser."""
+
+    __tablename__ = "google_sheet_rows"
+    __table_args__ = (UniqueConstraint("advertiser_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    advertiser_id: Mapped[int] = mapped_column(
+        ForeignKey("advertisers.id", ondelete="CASCADE"), nullable=False
+    )
+    spreadsheet_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    sheet_tab: Mapped[str] = mapped_column(String(100), nullable=False)
+    row_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    last_exported_first_seen: Mapped[date] = mapped_column(Date, nullable=False)
+    last_exported_brand: Mapped[str] = mapped_column(String(500), nullable=False)
+    last_exported_region: Mapped[str | None] = mapped_column(String(500))
+    last_exported_instagram: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+    advertiser: Mapped[Advertiser] = relationship(back_populates="sheet_row")

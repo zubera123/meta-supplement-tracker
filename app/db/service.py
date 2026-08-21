@@ -13,7 +13,7 @@ from app.db.session import (
     create_database_engine,
     create_session_factory,
 )
-from app.models import AdRecord
+from app.models import AdRecord, SheetCandidate, SheetRowState
 
 
 logger = logging.getLogger(__name__)
@@ -103,6 +103,76 @@ class ScanPersistenceService:
                 "The scan failed and its failure record could not be written"
             ) from exc
 
+    def prepare_sheet_candidates(
+        self,
+        records: Sequence[AdRecord],
+        *,
+        minimum_followers: int,
+        maximum_followers: int,
+    ) -> tuple[list[SheetCandidate], dict[int, SheetRowState]]:
+        """Load stable IDs and original first-seen dates from PostgreSQL."""
+
+        try:
+            with self._session_factory() as session:
+                repository = ScanRepository(session)
+                candidates: list[SheetCandidate] = []
+                for record in records:
+                    followers = (
+                        record.social_stats.instagram_followers
+                        if record.social_stats is not None
+                        else None
+                    )
+                    if (
+                        followers is None
+                        or followers < minimum_followers
+                        or followers > maximum_followers
+                    ):
+                        continue
+                    advertiser = repository.find_advertiser(record)
+                    if advertiser is None:
+                        raise DatabasePersistenceError(
+                            "A discovered advertiser was not found after persistence"
+                        )
+                    candidates.append(
+                        SheetCandidate(
+                            advertiser_id=advertiser.id,
+                            first_seen=advertiser.first_seen_at.date(),
+                            brand=advertiser.page_name,
+                            region=_readable_region(record),
+                            instagram_username=advertiser.instagram_username,
+                            followers=followers,
+                            active_ads=(
+                                record.active_ad_count
+                                if record.active_ad_count is not None
+                                else len(record.ads)
+                            ),
+                        )
+                    )
+                states = repository.sheet_row_states(
+                    [candidate.advertiser_id for candidate in candidates]
+                )
+                return candidates, states
+        except SQLAlchemyError as exc:
+            raise DatabasePersistenceError(
+                "Could not prepare candidates for Google Sheets"
+            ) from exc
+
+    def save_sheet_row_states(self, states: Sequence[SheetRowState]) -> None:
+        try:
+            with self._session_factory.begin() as session:
+                repository = ScanRepository(session)
+                for state in states:
+                    repository.upsert_sheet_row_state(state)
+        except SQLAlchemyError as exc:
+            raise DatabasePersistenceError(
+                "Google Sheet was updated but its PostgreSQL row mappings could not be saved"
+            ) from exc
+
     def close(self) -> None:
         if self._engine is not None:
             self._engine.dispose()
+
+
+def _readable_region(record: AdRecord) -> str:
+    regions = record.regions or [record.region]
+    return ", ".join(dict.fromkeys(region.value for region in regions))

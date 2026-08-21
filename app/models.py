@@ -1,6 +1,6 @@
 """Domain models shared across providers, jobs, and scoring."""
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 
 from pydantic import BaseModel, Field, HttpUrl, JsonValue
@@ -120,3 +120,28 @@ class BrandCandidate(BaseModel):
     qualifies: bool = False
     score: float = Field(default=0, ge=0, le=100)
     evaluation_reasons: list[str] = Field(default_factory=list)
+
+
+class SheetCandidate(BaseModel):
+    """A qualifying advertiser prepared from PostgreSQL for Sheet output."""
+
+    advertiser_id: int = Field(gt=0)
+    first_seen: date
+    brand: str = Field(min_length=1)
+    region: str = Field(min_length=1)
+    instagram_username: str | None = None
+    followers: int = Field(ge=0)
+    active_ads: int = Field(ge=0)
+
+
+class SheetRowState(BaseModel):
+    """PostgreSQL-only mapping between an advertiser and its visible Sheet row."""
+
+    advertiser_id: int = Field(gt=0)
+    spreadsheet_id: str = Field(min_length=1)
+    sheet_tab: str = Field(min_length=1)
+    row_number: int = Field(ge=2)
+    last_exported_first_seen: date
+    last_exported_brand: str = Field(min_length=1)
+    last_exported_region: str | None = None
+    last_exported_instagram: str | None = None

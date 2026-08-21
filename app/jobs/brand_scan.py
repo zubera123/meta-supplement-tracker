@@ -17,8 +17,9 @@ from app.db import (
 )
 from app.logging_config import configure_logging
 from app.models import AdRecord, Brand, BrandCandidate, ReviewStats, SocialStats
-from app.services import ProviderError, TransientProviderError
+from app.services import ProviderConfigurationError, ProviderError, TransientProviderError
 from app.services.google_docs import BrandOutputProvider
+from app.services.google_sheets import GoogleSheetsProvider, SheetSyncResult
 from app.services.instagram import InstagramProvider
 from app.services.meta_ads import (
     ApifyMetaAdsProvider,
@@ -122,8 +123,15 @@ class BrandScanJob:
 
 async def _run_meta_only(settings: Settings) -> int:
     persistence: ScanPersistenceService | None = None
+    sheets: GoogleSheetsProvider | None = None
+    sheet_sync: SheetSyncResult | None = None
     scan_run_id: int | None = None
     try:
+        if settings.google_sheets_enabled and not settings.persist_scan_results:
+            raise ProviderConfigurationError(
+                "PERSIST_SCAN_RESULTS=true is required for Google Sheets output "
+                "because stable identity and First seen come from PostgreSQL"
+            )
         if settings.persist_scan_results:
             persistence = ScanPersistenceService.from_database_url(
                 settings.database_url,
@@ -132,6 +140,11 @@ async def _run_meta_only(settings: Settings) -> int:
             # Fail before any paid provider call when persistence is required
             # but the configured database is unavailable.
             persistence.verify_connection()
+
+        if settings.google_sheets_enabled:
+            sheets = _build_sheets_provider(settings)
+            # Authenticate and verify/create the tab and headers before a paid run.
+            sheets.ensure_ready()
 
         provider = _build_meta_provider(settings)
         if persistence is not None:
@@ -142,11 +155,24 @@ async def _run_meta_only(settings: Settings) -> int:
         )
         if persistence is not None and scan_run_id is not None:
             persistence.persist_success(scan_run_id, records)
+        if sheets is not None and persistence is not None:
+            candidates, row_states = persistence.prepare_sheet_candidates(
+                records,
+                minimum_followers=settings.target_min_instagram_followers,
+                maximum_followers=settings.target_max_instagram_followers,
+            )
+            sheet_sync = sheets.sync_candidates(candidates, row_states)
+            persistence.save_sheet_row_states(sheet_sync.row_states)
         output = _build_meta_only_output(records, settings)
         output["persistence"] = {
             "enabled": persistence is not None,
             "scan_run_id": scan_run_id,
             "status": "succeeded" if persistence is not None else "disabled",
+        }
+        output["google_sheets"] = {
+            "enabled": sheets is not None,
+            "appended": sheet_sync.appended if sheet_sync else 0,
+            "updated": sheet_sync.updated if sheet_sync else 0,
         }
         print(json.dumps(output, indent=2))
         return 0
@@ -202,6 +228,33 @@ def _check_database(settings: Settings) -> int:
     finally:
         persistence.close()
     print(json.dumps({"database": "reachable"}))
+    return 0
+
+
+def _build_sheets_provider(settings: Settings) -> GoogleSheetsProvider:
+    return GoogleSheetsProvider(
+        spreadsheet_id=settings.google_sheet_id,
+        sheet_tab=settings.google_sheet_tab,
+        service_account_json=settings.google_service_account_json,
+        retry_attempts=settings.provider_retry_attempts,
+        retry_min_wait_seconds=settings.provider_retry_min_wait_seconds,
+        retry_max_wait_seconds=settings.provider_retry_max_wait_seconds,
+    )
+
+
+def _check_sheets(settings: Settings) -> int:
+    provider = _build_sheets_provider(settings)
+    provider.ensure_ready(verify_write_access=True)
+    print(
+        json.dumps(
+            {
+                "spreadsheet": "reachable",
+                "tab": settings.google_sheet_tab,
+                "headers": "ready",
+                "write_access": "verified",
+            }
+        )
+    )
     return 0
 
 
@@ -263,6 +316,11 @@ def main() -> int:
         action="store_true",
         help="Verify DATABASE_URL connectivity without running a scan",
     )
+    commands.add_argument(
+        "--check-sheets",
+        action="store_true",
+        help="Verify Google Sheets access, tab, headers, and Editor permission",
+    )
     args = parser.parse_args()
 
     settings = get_settings()
@@ -270,6 +328,8 @@ def main() -> int:
     try:
         if args.check_db:
             return _check_database(settings)
+        if args.check_sheets:
+            return _check_sheets(settings)
         return asyncio.run(_run_meta_only(settings))
     except (
         ProviderError,

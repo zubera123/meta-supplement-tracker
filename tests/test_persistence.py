@@ -10,11 +10,24 @@ from sqlalchemy.pool import StaticPool
 
 from app.config import Settings
 from app.db.base import Base
-from app.db.models import Ad, Advertiser, AdvertiserObservation, ScanRun
+from app.db.models import (
+    Ad,
+    Advertiser,
+    AdvertiserObservation,
+    GoogleSheetRow,
+    ScanRun,
+)
 from app.db.service import ScanPersistenceService
 from app.db.session import DatabaseConfigurationError, normalize_database_url
 from app.jobs.brand_scan import _run_meta_only
-from app.models import AdRecord, Brand, MetaAdDetails, Region, SocialStats
+from app.models import (
+    AdRecord,
+    Brand,
+    MetaAdDetails,
+    Region,
+    SheetRowState,
+    SocialStats,
+)
 
 
 @pytest.fixture
@@ -201,3 +214,66 @@ def test_enabled_persistence_requires_database_before_provider_configuration() -
 
     with pytest.raises(DatabaseConfigurationError, match="DATABASE_URL is required"):
         asyncio.run(_run_meta_only(settings))
+
+
+def test_sheet_candidates_use_database_first_seen_and_exclude_unknown_followers(
+    session_factory: sessionmaker[Session],
+) -> None:
+    service = ScanPersistenceService(session_factory)
+    first_seen = datetime(2026, 8, 1, tzinfo=UTC)
+    second_seen = first_seen + timedelta(days=10)
+    first_run_id = service.create_scan_run(["UK"])
+    service.persist_success(
+        first_run_id,
+        [ad_record(observed_at=first_seen, followers=20_000)],
+    )
+    second_record = ad_record(observed_at=second_seen, followers=30_000)
+    second_run_id = service.create_scan_run(["UK"])
+    service.persist_success(second_run_id, [second_record])
+
+    candidates, states = service.prepare_sheet_candidates(
+        [second_record], minimum_followers=10_000, maximum_followers=100_000
+    )
+    unknown_record = ad_record(observed_at=second_seen, followers=None)
+    unknown_candidates, _ = service.prepare_sheet_candidates(
+        [unknown_record], minimum_followers=10_000, maximum_followers=100_000
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].first_seen.isoformat() == "2026-08-01"
+    assert candidates[0].followers == 30_000
+    assert states == {}
+    assert unknown_candidates == []
+
+
+def test_sheet_row_mapping_is_upserted_by_stable_advertiser_identity(
+    session_factory: sessionmaker[Session],
+) -> None:
+    service = ScanPersistenceService(session_factory)
+    observed_at = datetime(2026, 8, 1, tzinfo=UTC)
+    scan_run_id = service.create_scan_run(["UK"])
+    record = ad_record(observed_at=observed_at, followers=20_000)
+    service.persist_success(scan_run_id, [record])
+    candidates, _ = service.prepare_sheet_candidates(
+        [record], minimum_followers=10_000, maximum_followers=100_000
+    )
+    advertiser_id = candidates[0].advertiser_id
+
+    state = SheetRowState(
+        advertiser_id=advertiser_id,
+        spreadsheet_id="sheet-id",
+        sheet_tab="Candidates",
+        row_number=2,
+        last_exported_first_seen=candidates[0].first_seen,
+        last_exported_brand=candidates[0].brand,
+        last_exported_region="UK",
+        last_exported_instagram="@example_supplements",
+    )
+    service.save_sheet_row_states([state])
+    service.save_sheet_row_states([state.model_copy(update={"row_number": 4})])
+
+    with session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(GoogleSheetRow)) == 1
+        stored = session.scalar(select(GoogleSheetRow))
+        assert stored is not None
+        assert stored.row_number == 4

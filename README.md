@@ -2,7 +2,7 @@
 
 Initial production-oriented foundation for discovering supplement brands advertising on Meta. Apify's `solidcode/meta-ads-library-scraper` Actor is the primary commercial discovery provider. Meta's official Ad Library API provider remains available as an alternative for its documented UK/EU coverage.
 
-No external-data integration is simulated. The Apify Actor supplies linked Instagram metadata where Meta exposes it; a separate Instagram provider, reviews, and Google Docs remain explicit contracts until verified sources are selected and implemented.
+No external-data integration is simulated. The Apify Actor supplies linked Instagram metadata where Meta exposes it, and qualifying advertisers can be synchronized to one Google Sheets tab. Reviews and defensible spend estimation remain unimplemented until verified sources are selected.
 
 ## Current capabilities
 
@@ -12,6 +12,7 @@ No external-data integration is simulated. The Apify Actor supplies linked Insta
 - Apify Actor discovery for active commercial ads in the UK, supported EU countries, USA, and Canada
 - Optional advertiser-page enrichment with linked Instagram username and follower count
 - PostgreSQL scan history with advertiser/ad upserts and follower observations
+- Idempotent Google Sheets candidate output backed by PostgreSQL advertiser identity
 - Alembic-managed database schema using SQLAlchemy 2.x and psycopg 3
 - Official Meta Ad Library API discovery retained as a UK/EU alternative
 - Cursor pagination, bounded transient retries, ad deduplication, and advertiser aggregation
@@ -94,8 +95,10 @@ Settings are loaded from environment variables and, for local development, `.env
 | `APIFY_REQUEST_TIMEOUT_SECONDS` | `120`; overall wait limit for each Actor run |
 | `INSTAGRAM_PROVIDER`, `INSTAGRAM_API_KEY` | Instagram provider placeholders |
 | `REVIEWS_PROVIDER`, `REVIEWS_API_KEY` | Reviews provider placeholders |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | Service-account JSON value or provider-specific reference; pending implementation |
-| `GOOGLE_DOC_ID` | Target Google document ID |
+| `GOOGLE_SHEETS_ENABLED` | `false`; enable candidate synchronization after PostgreSQL and Sheets are configured |
+| `GOOGLE_SHEET_ID` | Target spreadsheet ID; the supplied example points to the intended workbook |
+| `GOOGLE_SHEET_TAB` | `Candidates`; created when absent if the service account has Editor access |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Complete Google Cloud service-account JSON credential; secret and required when Sheets is enabled |
 
 Never commit `.env`, credentials, or service-account files. The supplied `.gitignore` excludes them.
 
@@ -137,6 +140,52 @@ railway ssh -- python -m app.jobs.brand_scan --check-db
 The connectivity command prints only `{"database": "reachable"}` and never prints the connection URL. Migrations are intentionally explicit rather than being run during every web-service startup.
 
 With persistence enabled, `python -m app.jobs.brand_scan --meta-only` verifies the database before any paid Apify Actor start. It creates a `scan_runs` row, upserts advertisers by Meta page ID and ads by Meta ad ID, writes one advertiser observation per scan, then marks the scan successful with its counts. Provider or persistence failures mark the scan failed when the database remains writable. An unavailable or missing database aborts clearly; results are never silently discarded. The JSON output includes the persisted scan-run ID.
+
+## Google Sheets candidate output
+
+Google Sheets output is optional and is used only by `--meta-only`. It requires `PERSIST_SCAN_RESULTS=true`: PostgreSQL remains the source of stable advertiser identity, the original first-seen date, and the row mapping. The spreadsheet receives no hidden identity column, metadata tab, or second application-created tab.
+
+The configured tab contains exactly these visible columns:
+
+| First seen | Brand | Region | Instagram | Followers | Active ads | Spend est. | Spend source | Reviews | Review source |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+
+Only advertisers with a known Instagram follower count from 10,000 through 100,000 inclusive are written. Unknown, lower, and higher counts are excluded rather than guessed. `First seen` is the advertiser's original PostgreSQL date in `YYYY-MM-DD` format. A new advertiser receives one row with blank spend and review fields. A repeated advertiser updates columns A–F in its mapped row; columns G–J are never overwritten, preserving future spend/review values or formulas. Writes are batched, duplicate input advertisers are collapsed by PostgreSQL ID, and transient HTTP 429/5xx responses use bounded exponential retries.
+
+### Google Cloud and spreadsheet setup
+
+1. In [Google Cloud Console](https://console.cloud.google.com/), select or create the project that will own this integration.
+2. Follow Google's [Sheets API Python setup](https://developers.google.com/workspace/sheets/api/quickstart/python) to open **APIs & Services → Library**, find **Google Sheets API**, and click **Enable**.
+3. Open **IAM & Admin → Service Accounts** and follow Google's [service-account creation guide](https://docs.cloud.google.com/iam/docs/service-accounts-create). No project-wide role is needed merely to edit a spreadsheet that is shared directly with the account.
+4. Open that service account and follow Google's [service-account key guide](https://docs.cloud.google.com/iam/docs/keys-create-delete) to select **Keys → Add key → Create new key → JSON → Create**. Google downloads the private key once. Store it securely; never commit it or place it in `.env.example`.
+5. Copy the service account's `client_email` value. Open the target spreadsheet in Google Sheets and follow Google's [Drive sharing instructions](https://support.google.com/drive/answer/2494822?hl=en) to add that email with **Editor** access.
+6. In the Railway application service's **Variables** tab, add the complete downloaded JSON object as the secret `GOOGLE_SERVICE_ACCOUNT_JSON`. Railway accepts the JSON value directly; do not split its fields into separate variables or print it in logs.
+7. Add the remaining non-secret variables:
+
+   ```env
+   GOOGLE_SHEETS_ENABLED=true
+   GOOGLE_SHEET_ID=1m6DRz8GzhW_Xn297WDfa-amZHMFn9v8qqhvRLzlIy84
+   GOOGLE_SHEET_TAB=Candidates
+   ```
+
+8. Redeploy the application, then apply the new PostgreSQL row-mapping migration:
+
+   ```bash
+   railway ssh -- alembic upgrade head
+   railway ssh -- alembic current
+   ```
+
+9. Verify authentication, spreadsheet access, the `Candidates` tab, exact headers, and Editor permission without running Apify or adding a candidate:
+
+   ```bash
+   railway ssh -- python -m app.jobs.brand_scan --check-sheets
+   ```
+
+The check creates only the configured `Candidates` tab and its exact header when missing. Otherwise, it performs an idempotent header write to verify Editor permission. It never starts a scan, calls Apify, or adds fake candidates. A successful response contains `"spreadsheet": "reachable"`, `"headers": "ready"`, and `"write_access": "verified"` without exposing credentials.
+
+For local use, put the same four variables in the untracked `.env` file and run `python -m app.jobs.brand_scan --check-sheets`. If access is denied, confirm that the Sheets API is enabled in the credential's project and that the spreadsheet—not merely a similarly named Drive file—was shared with the exact service-account email as Editor.
+
+The implementation uses the documented Sheets API v4 [spreadsheet structure updates](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets/batchUpdate) and [values batch updates](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values/batchUpdate). Its retry policy follows Google's [Sheets API quota guidance](https://developers.google.com/workspace/sheets/api/limits): rate limits and transient server responses use bounded exponential backoff.
 
 ## Apify Meta ads provider
 
@@ -199,7 +248,7 @@ If the token exists only in Railway, do not copy it locally. After deploying thi
 railway ssh -- env SCAN_REGIONS=UK APIFY_MAX_RESULTS_PER_QUERY=20 APIFY_INCLUDE_ADVERTISER_DETAILS=true APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN=0.03 python -m app.jobs.brand_scan --meta-only
 ```
 
-Railway's current [`railway ssh` documentation](https://docs.railway.com/cli/ssh) supports running a command in the deployed service. This override performs one UK country run with at most 20 fully enriched rows. Current documented event pricing projects $0.023: $0.005 to start plus 20 × $0.0009, protected by a hard $0.03 ceiling. It does not expose the token. The command invokes only Meta discovery; it does not run a separate Instagram scraper, reviews, Google Docs, or scheduling.
+Railway's current [`railway ssh` documentation](https://docs.railway.com/cli/ssh) supports running a command in the deployed service. This override performs one UK country run with at most 20 fully enriched rows. Current documented event pricing projects $0.023: $0.005 to start plus 20 × $0.0009, protected by a hard $0.03 ceiling. It does not expose the token. The command invokes Meta discovery and, if enabled, persistence and candidate-sheet synchronization; it does not run a separate Instagram scraper, reviews, or scheduling.
 
 A sanitised output shape is:
 
@@ -302,7 +351,7 @@ After configuring the authorised token, run:
 python -m app.jobs.brand_scan --meta-only
 ```
 
-This performs only Meta discovery. The official provider has no linked Instagram enrichment, so its follower status is unknown. It does not invoke a separate Instagram provider, reviews, Google Docs, scheduling, or fake data. Results use the same advertiser-summary JSON shape documented above. When `PERSIST_SCAN_RESULTS=true`, the same normalized output is stored through the persistence service.
+This performs only Meta discovery. The official provider has no linked Instagram enrichment, so its follower status is unknown. It does not invoke a separate Instagram provider, reviews, scheduling, or fake data. Results use the same advertiser-summary JSON shape documented above. When `PERSIST_SCAN_RESULTS=true`, the same normalized output is stored through the persistence service; Sheets output additionally requires `GOOGLE_SHEETS_ENABLED=true` and excludes unknown followers.
 
 
 ## Tests
@@ -342,8 +391,7 @@ No Railway deployment is performed by this project setup.
 - Defensible commercial Meta spend estimation; the official Ad Library API does not return commercial spend
 - EU countries absent from the current SolidCode Actor country schema
 - Instagram profile URL, because the current Actor does not document one
-- Trustpilot or other reviews enrichment
-- Google Docs authentication and writes
+- Trustpilot or other reviews enrichment; the corresponding Sheet columns intentionally remain blank
 - Scheduled invocation of the scan job
 
 Each is intentionally left behind an interface rather than returning fabricated data. Provider choice must be validated against official documentation, access requirements, terms, and available fields before implementation.
