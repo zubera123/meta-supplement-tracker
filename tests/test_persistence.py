@@ -382,3 +382,35 @@ def test_review_history_and_business_unit_cache_are_persisted(
         assert float(observation.review_trust_score) == 4.6
         assert float(observation.review_stars) == 4.5
         assert observation.review_desirable is True
+
+
+def test_apify_review_source_survives_cache_round_trip(
+    session_factory: sessionmaker[Session],
+) -> None:
+    service = ScanPersistenceService(session_factory)
+    observed_at = datetime(2026, 8, 21, tzinfo=UTC)
+    stats = ReviewStats(
+        source="Trustpilot via Apify",
+        review_count=425,
+        business_unit_id="business-unit-1",
+        matched_domain="example.com",
+        observed_at=observed_at,
+    )
+    record = ad_record(observed_at=observed_at, followers=20_000).model_copy(
+        update={
+            "review_enrichment": ReviewEnrichmentResult(
+                status="matched",
+                stats=stats,
+                reason="matched",
+                attempted_domain="example.com",
+                refreshed_at=observed_at,
+            )
+        }
+    )
+
+    scan_run_id = service.create_scan_run(["UK"])
+    service.persist_success(scan_run_id, [record])
+    cache = service.load_review_caches([record])[0]
+
+    assert cache.latest_stats is not None
+    assert cache.latest_stats.source == "Trustpilot via Apify"

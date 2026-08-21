@@ -39,6 +39,7 @@ from app.services.meta_ads import (
     MetaAdsProvider,
 )
 from app.services.reviews import (
+    ApifyTrustpilotReviewsProvider,
     ReviewsProvider,
     TrustpilotReviewsProvider,
     resolve_advertiser_domain,
@@ -317,7 +318,12 @@ class CandidatePipeline:
                     record.model_copy(update={"review_enrichment": result})
                 )
                 continue
-            domain, resolution_reason = resolve_advertiser_domain(record)
+            domain, resolution_reason = resolve_advertiser_domain(
+                record,
+                include_brand_website=not isinstance(
+                    self.reviews, ApifyTrustpilotReviewsProvider
+                ),
+            )
             if domain is None:
                 result = unavailable_review(resolution_reason)
             elif _review_cache_is_fresh(cache, domain, refresh_cutoff):
@@ -464,7 +470,7 @@ async def _run_scan_command(settings: Settings, *, require_full_outputs: bool) -
         finally:
             if persistence is not None:
                 persistence.close()
-            if isinstance(reviews, TrustpilotReviewsProvider):
+            if reviews is not None:
                 await reviews.close()
 
 
@@ -538,21 +544,38 @@ def _build_sheets_provider(settings: Settings) -> GoogleSheetsProvider:
 
 
 def _build_reviews_provider(settings: Settings) -> ReviewsProvider:
-    configured_provider = (settings.reviews_provider or "").casefold()
-    if configured_provider != "trustpilot":
-        raise ProviderConfigurationError(
-            "REVIEWS_PROVIDER=trustpilot is required for Trustpilot enrichment"
+    configured_provider = (
+        settings.reviews_provider or "apify_trustpilot"
+    ).casefold()
+    if configured_provider == "apify_trustpilot":
+        return ApifyTrustpilotReviewsProvider(
+            api_token=settings.apify_api_token,
+            actor_id=settings.apify_trustpilot_actor_id,
+            max_total_charge_usd_per_run=(
+                settings.apify_trustpilot_max_total_charge_usd_per_run
+            ),
+            minimum_desirable_reviews=settings.trustpilot_min_desirable_reviews,
+            monthly_budget_gbp=settings.apify_monthly_budget_gbp,
+            budget_gbp_per_usd=settings.apify_budget_gbp_per_usd,
+            request_timeout_seconds=settings.apify_request_timeout_seconds,
+            retry_attempts=settings.provider_retry_attempts,
+            retry_min_wait_seconds=settings.provider_retry_min_wait_seconds,
+            retry_max_wait_seconds=settings.provider_retry_max_wait_seconds,
         )
-    return TrustpilotReviewsProvider(
-        api_key=settings.trustpilot_api_key,
-        minimum_desirable_reviews=settings.trustpilot_min_desirable_reviews,
-        request_timeout_seconds=settings.trustpilot_request_timeout_seconds,
-        retry_attempts=settings.provider_retry_attempts,
-        retry_min_wait_seconds=settings.provider_retry_min_wait_seconds,
-        retry_max_wait_seconds=settings.provider_retry_max_wait_seconds,
-        min_request_interval_seconds=(
-            settings.trustpilot_min_request_interval_seconds
-        ),
+    if configured_provider == "trustpilot":
+        return TrustpilotReviewsProvider(
+            api_key=settings.trustpilot_api_key,
+            minimum_desirable_reviews=settings.trustpilot_min_desirable_reviews,
+            request_timeout_seconds=settings.trustpilot_request_timeout_seconds,
+            retry_attempts=settings.provider_retry_attempts,
+            retry_min_wait_seconds=settings.provider_retry_min_wait_seconds,
+            retry_max_wait_seconds=settings.provider_retry_max_wait_seconds,
+            min_request_interval_seconds=(
+                settings.trustpilot_min_request_interval_seconds
+            ),
+        )
+    raise ProviderConfigurationError(
+        "REVIEWS_PROVIDER must be trustpilot or apify_trustpilot when reviews are enabled"
     )
 
 
@@ -577,14 +600,18 @@ async def _check_reviews(settings: Settings) -> int:
     try:
         await provider.check_connection()
     finally:
-        if isinstance(provider, TrustpilotReviewsProvider):
-            await provider.close()
+        await provider.close()
+    is_apify = isinstance(provider, ApifyTrustpilotReviewsProvider)
     print(
         json.dumps(
             {
-                "provider": "Trustpilot",
+                "provider": (
+                    "Trustpilot via Apify" if is_apify else "Trustpilot"
+                ),
                 "api": "reachable",
                 "authentication": "accepted",
+                "actor_available": True if is_apify else None,
+                "actor_started": False,
                 "meta_provider_called": False,
             }
         )
@@ -734,7 +761,7 @@ def main() -> int:
     commands.add_argument(
         "--check-reviews",
         action="store_true",
-        help="Verify Trustpilot API configuration without calling Meta or Apify",
+        help="Verify review provider configuration without starting a paid Actor or Meta",
     )
     args = parser.parse_args()
 

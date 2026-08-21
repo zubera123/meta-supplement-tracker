@@ -85,13 +85,17 @@ class Settings(BaseSettings):
     apify_monthly_budget_gbp: float = Field(default=30.0, gt=0)
     apify_budget_gbp_per_usd: float = Field(default=1.0, gt=0)
     apify_request_timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
+    apify_trustpilot_actor_id: str = "automation-lab/trustpilot-scraper"
+    apify_trustpilot_max_total_charge_usd_per_run: float = Field(
+        default=0.01, gt=0
+    )
     google_sheets_enabled: bool = False
     google_sheet_id: str | None = None
     google_sheet_tab: str = Field(default="Candidates", min_length=1, max_length=100)
     google_service_account_json: str | None = None
     instagram_provider: str | None = None
     instagram_api_key: str | None = None
-    reviews_provider: str | None = None
+    reviews_provider: str | None = "apify_trustpilot"
     reviews_api_key: str | None = None
     reviews_enabled: bool = False
     trustpilot_api_key: str | None = None
@@ -102,17 +106,23 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_apify_charge_ceiling(self) -> Self:
-        """Reject a single-run ceiling that already exceeds the monthly guard."""
+        """Reject either Apify run ceiling when it exceeds the monthly guard."""
 
-        ceiling_gbp = (
-            self.apify_max_total_charge_usd_per_run
-            * self.apify_budget_gbp_per_usd
+        ceilings = (
+            (
+                "APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN",
+                self.apify_max_total_charge_usd_per_run,
+            ),
+            (
+                "APIFY_TRUSTPILOT_MAX_TOTAL_CHARGE_USD_PER_RUN",
+                self.apify_trustpilot_max_total_charge_usd_per_run,
+            ),
         )
-        if ceiling_gbp > self.apify_monthly_budget_gbp:
-            raise ValueError(
-                "APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN exceeds "
-                "APIFY_MONTHLY_BUDGET_GBP after conversion"
-            )
+        for name, ceiling_usd in ceilings:
+            if ceiling_usd * self.apify_budget_gbp_per_usd > self.apify_monthly_budget_gbp:
+                raise ValueError(
+                    f"{name} exceeds APIFY_MONTHLY_BUDGET_GBP after conversion"
+                )
         pairs = (
             ("SPEND_TARGET", self.spend_target_min_usd, self.spend_target_max_usd),
             ("SPEND_CPM_UK", self.spend_cpm_uk_low_usd, self.spend_cpm_uk_high_usd),

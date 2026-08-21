@@ -98,7 +98,7 @@ Settings are loaded from environment variables and, for local development, `.env
 | `META_API_VERSION` | `v26.0`; update only after reviewing Meta's versioned documentation |
 | `META_REQUEST_TIMEOUT_SECONDS` | `30` |
 | `META_MAX_PAGES_PER_QUERY` | `100`; local safety ceiling, not a Meta rate limit |
-| `APIFY_API_TOKEN` | Required when `META_AD_PROVIDER=apify`; keep it in Railway or local `.env` only |
+| `APIFY_API_TOKEN` | Required when `META_AD_PROVIDER=apify` or `REVIEWS_PROVIDER=apify_trustpilot`; keep it in Railway or local `.env` only |
 | `APIFY_ACTOR_ID` | `solidcode/meta-ads-library-scraper` |
 | `APIFY_MAX_RESULTS_PER_QUERY` | `500`; maximum results for each country Actor run, shared across all search terms |
 | `APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN` | `0.02`; server-side ceiling for each Actor run |
@@ -106,9 +106,11 @@ Settings are loaded from environment variables and, for local development, `.env
 | `APIFY_MONTHLY_BUDGET_GBP` | `30`; aborts before starting paid runs when projected monthly usage exceeds this guard |
 | `APIFY_BUDGET_GBP_PER_USD` | `1.0`; conservative conversion applied to Apify's USD usage figures |
 | `APIFY_REQUEST_TIMEOUT_SECONDS` | `120`; overall wait limit for each Actor run |
+| `APIFY_TRUSTPILOT_ACTOR_ID` | `automation-lab/trustpilot-scraper` |
+| `APIFY_TRUSTPILOT_MAX_TOTAL_CHARGE_USD_PER_RUN` | `0.01`; strict server-side ceiling for each review lookup |
 | `INSTAGRAM_PROVIDER`, `INSTAGRAM_API_KEY` | Instagram provider placeholders |
 | `REVIEWS_ENABLED` | `false`; enables optional candidate review enrichment |
-| `REVIEWS_PROVIDER` | Set to `trustpilot` when review enrichment is enabled |
+| `REVIEWS_PROVIDER` | `apify_trustpilot` (practical default) or `trustpilot`; ignored when reviews are disabled |
 | `TRUSTPILOT_API_KEY` | Trustpilot API-module key; secret, never log or commit it |
 | `TRUSTPILOT_MIN_DESIRABLE_REVIEWS` | `300`; positive signal only, never a rejection rule |
 | `TRUSTPILOT_REFRESH_HOURS` | `24`; Trustpilot's display cache-refresh requirement |
@@ -186,7 +188,39 @@ Apply migration `20260821_0004` before enabling this version in production. The 
 
 ## Optional Trustpilot review enrichment
 
-Set `REVIEWS_ENABLED=true` and `REVIEWS_PROVIDER=trustpilot` to enrich follower- and relevance-qualified candidates through Trustpilot's public Business Units API. Review data never controls candidate qualification. At least 300 reviews sets an internal desirable flag; lower counts remain valid and unknown data receives no penalty.
+Set `REVIEWS_ENABLED=true` to enrich only advertisers that already pass supplement relevance and have 10,000–100,000 Instagram followers. Review data never controls candidate qualification. At least 300 reviews sets an internal desirable flag; lower counts remain valid and unknown data receives no penalty. `REVIEWS_ENABLED=false` disables both providers.
+
+### Apify provider (practical default)
+
+`REVIEWS_PROVIDER=apify_trustpilot` uses the existing `APIFY_API_TOKEN` with [`automation-lab/trustpilot-scraper`](https://apify.com/automation-lab/trustpilot-scraper). The Actor's current documented input schema supports `mode`, `searchQueries`, and `maxResults`; its documented business result contains `businessId`, `domain`, `trustScore`, `stars`, and `numberOfReviews`. Each lookup submits exactly:
+
+```json
+{"mode":"search","searchQueries":["the-real-ad-domain.example"],"maxResults":1}
+```
+
+The query value comes only from an existing ad's `landing_page_domain`, or from the hostname of its genuine `landing_page_url` when no documented domain is present. It is never derived from the advertiser name. Returned data is accepted only when `type=business` and the normalized `domain` exactly matches the submitted domain. The dataset request selects only business metadata fields; no review text is requested. A missing or mismatched result stays unknown.
+
+As documented on the Actor page on 21 August 2026, pricing is pay per event: $0.001 per run start plus $0.00345/Free, $0.00300/Bronze, $0.00234/Silver, $0.00180/Gold, $0.00120/Platinum, or $0.00084/Diamond per result. One business-result lookup therefore costs approximately $0.00445 on Free and $0.00400 on Bronze, before any included Apify credits. The live Pricing tab remains authoritative. The app sends both Apify's documented `maxItems=1` and `maxTotalChargeUsd=0.01`, with `restartOnError=false`.
+
+Before every paid review start, the provider reads account-wide `current.monthlyUsageUsd` from Apify's [Get limits endpoint](https://docs.apify.com/api/v2/users-me-limits-get). Current usage, conservative in-process reservations, and the next $0.01 ceiling are converted with `APIFY_BUDGET_GBP_PER_USD` and rejected if they would exceed `APIFY_MONTHLY_BUDGET_GBP` (£30 by default). This budget includes both Meta and review Actor usage because Apify reports account-wide usage. The paid start request is never retried; only safe run-status and dataset reads use bounded transient retries. Actor failures, timeouts, malformed results, and budget rejections fail softly for that advertiser and preserve earlier valid Sheet review values.
+
+Configure the same shared/reference values on the Railway web and Cron services:
+
+```env
+REVIEWS_ENABLED=true
+REVIEWS_PROVIDER=apify_trustpilot
+APIFY_API_TOKEN=
+APIFY_TRUSTPILOT_ACTOR_ID=automation-lab/trustpilot-scraper
+APIFY_TRUSTPILOT_MAX_TOTAL_CHARGE_USD_PER_RUN=0.01
+TRUSTPILOT_MIN_DESIRABLE_REVIEWS=300
+TRUSTPILOT_REFRESH_HOURS=24
+```
+
+`python -m app.jobs.brand_scan --check-reviews` validates the Apify token, account-limits endpoint, and Actor metadata with authenticated GET requests. It reports `actor_started=false` and never constructs the Meta provider or starts either paid Actor.
+
+### Official Trustpilot API alternative
+
+Set `REVIEWS_PROVIDER=trustpilot` to use the existing official Trustpilot Business Units provider instead. It requires `TRUSTPILOT_API_KEY` and remains unchanged as an alternative.
 
 The implementation uses only Trustpilot's documented public endpoints:
 
@@ -197,7 +231,7 @@ The implementation uses only Trustpilot's documented public endpoints:
 
 The source is always `Trustpilot`. PostgreSQL retains real landing-page URLs/domains, caches the matched Business Unit ID and domain, latest count/scores, and last successful resolution/refresh time. Every scan observation records its review status, values, desirable flag, match identity, and reason. A fresh cache suppresses API calls. Trustpilot says Business Unit IDs normally do not change and advises storing them instead of resolving each time. Because the Sheet displays the values, the default refresh interval is 24 hours rather than seven days, following Trustpilot's Content Refresh Guidelines.
 
-Domain resolution never derives a website from the advertiser name. It accepts only the existing `Brand.website`, Apify `ctaDomain` normalized as `landing_page_domain`, or the hostname of a genuine `ctaUrl` when no documented domain is present. Multiple conflicting domains, missing destinations, IP addresses, and Meta/Instagram destinations remain unknown with a persisted reason. The current SolidCode Actor documents and can return `ctaDomain`/`ctaUrl` when ad-detail scraping is enabled, but individual commercial results may omit both, so Trustpilot coverage is necessarily partial.
+Domain resolution never derives a website from the advertiser name. The Apify review provider accepts only Meta-ad `ctaDomain` normalized as `landing_page_domain`, or the hostname of a genuine `ctaUrl` when no documented domain is present. The official provider retains its existing support for a genuine `Brand.website` value as well. Multiple conflicting domains, missing destinations, IP addresses, and Meta/Instagram destinations remain unknown with a persisted reason. The current SolidCode Actor documents and can return `ctaDomain`/`ctaUrl` when ad-detail scraping is enabled, but individual commercial results may omit both, so Trustpilot coverage is necessarily partial.
 
 HTTP 429 and transient 5xx/network failures use bounded retries. A numeric `Retry-After` is honored when it fits inside the configured scan retry window; a longer rate-limit wait fails softly and is deferred to a later scheduled run. Trustpilot currently recommends no more than 833 calls per five minutes or 10,000 calls/hour. Requests are serialized and spaced by at least 0.4 seconds by default, capping steady throughput at 750 calls per five minutes and 9,000 calls/hour before network latency. Persistent ID reuse and the 24-hour refresh gate reduce it further. Trustpilot outages and malformed responses are logged without credentials and stored as an error outcome; they do not cancel the paid Meta result, PostgreSQL persistence, or Sheet sync. Existing valid review cells are preserved if a later lookup is unavailable.
 
@@ -213,13 +247,13 @@ TRUSTPILOT_REQUEST_TIMEOUT_SECONDS=30
 TRUSTPILOT_MIN_REQUEST_INTERVAL_SECONDS=0.4
 ```
 
-Verify API-key acceptance without starting Meta discovery or Apify:
+Verify the selected provider without starting Meta discovery or a paid Actor:
 
 ```bash
 python -m app.jobs.brand_scan --check-reviews
 ```
 
-The check resolves Trustpilot's own documented domain and prints only provider/connectivity status. Apply migration `20260821_0005` before enabling enrichment.
+For the official provider, the check resolves Trustpilot's own documented domain. For the Apify provider, it uses only free metadata/limits GET requests. Both print only provider/connectivity status. Apply migrations through `20260821_0006` before enabling the Apify provider; `0006` adds only a cached review-source column so `Trustpilot via Apify` survives refresh-cache reuse. The existing review observation/history tables are reused.
 
 ## Google Sheets candidate output
 
@@ -230,7 +264,7 @@ The configured tab contains exactly these visible columns:
 | First seen | Brand | Region | Instagram | Followers | Active ads | Spend est. | Spend source | Reviews | Review source |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 
-Only advertisers with a known Instagram follower count from 10,000 through 100,000 inclusive are written. Unknown, lower, and higher counts are excluded rather than guessed. `First seen` is the advertiser's original PostgreSQL date in `YYYY-MM-DD` format. Spend estimates update columns G–H. A successful Trustpilot match writes its numeric count and `Trustpilot` to I–J. Missing or failed review enrichment leaves those cells unchanged, preserving an earlier valid value. No visible columns are added. Unknown spend is written explicitly as `Unknown`. Writes are batched, duplicate input advertisers are collapsed by PostgreSQL ID, and transient HTTP 429/5xx responses use bounded exponential retries.
+Only advertisers with a known Instagram follower count from 10,000 through 100,000 inclusive are written. Unknown, lower, and higher counts are excluded rather than guessed. `First seen` is the advertiser's original PostgreSQL date in `YYYY-MM-DD` format. Spend estimates update columns G–H. A successful review match writes its numeric count and either `Trustpilot via Apify` or `Trustpilot` to I–J. Missing or failed review enrichment leaves those cells unchanged, preserving an earlier valid value. No visible columns are added. Unknown spend is written explicitly as `Unknown`. Writes are batched, duplicate input advertisers are collapsed by PostgreSQL ID, and transient HTTP 429/5xx responses use bounded exponential retries.
 
 ### Google Cloud and spreadsheet setup
 
@@ -320,6 +354,7 @@ The expression runs every day at **00:00 UTC** and **12:00 UTC**. Railway evalua
    - `DATABASE_URL`, `PERSIST_SCAN_RESULTS`, `DATABASE_CONNECT_TIMEOUT_SECONDS`
    - `META_AD_PROVIDER`, `APIFY_API_TOKEN`, `APIFY_ACTOR_ID`, `APIFY_MAX_RESULTS_PER_QUERY`
    - `APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN`, `APIFY_INCLUDE_ADVERTISER_DETAILS`, `APIFY_MONTHLY_BUDGET_GBP`, `APIFY_BUDGET_GBP_PER_USD`, `APIFY_REQUEST_TIMEOUT_SECONDS`
+   - `APIFY_TRUSTPILOT_ACTOR_ID`, `APIFY_TRUSTPILOT_MAX_TOTAL_CHARGE_USD_PER_RUN`
    - `GOOGLE_SHEETS_ENABLED`, `GOOGLE_SHEET_ID`, `GOOGLE_SHEET_TAB`, `GOOGLE_SERVICE_ACCOUNT_JSON`
    - `REVIEWS_ENABLED`, `REVIEWS_PROVIDER`, `TRUSTPILOT_API_KEY`, `TRUSTPILOT_MIN_DESIRABLE_REVIEWS`, `TRUSTPILOT_REFRESH_HOURS`, `TRUSTPILOT_REQUEST_TIMEOUT_SECONDS`, `TRUSTPILOT_MIN_REQUEST_INTERVAL_SECONDS`
 

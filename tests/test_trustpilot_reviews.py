@@ -132,7 +132,7 @@ def test_missing_domain_remains_unknown_without_guessing_brand_name() -> None:
     domain, reason = resolve_advertiser_domain(record(domain=None))
 
     assert domain is None
-    assert "No genuine" in reason
+    assert "No genuine landing-page" in reason
 
 
 def test_no_trustpilot_business_unit_is_unavailable() -> None:

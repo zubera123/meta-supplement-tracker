@@ -69,6 +69,7 @@ class Advertiser(Base):
         DateTime(timezone=True)
     )
     latest_trustpilot_review_count: Mapped[int | None] = mapped_column(Integer)
+    latest_trustpilot_review_source: Mapped[str | None] = mapped_column(String(50))
     latest_trustpilot_trust_score: Mapped[float | None] = mapped_column(Numeric(3, 2))
     latest_trustpilot_stars: Mapped[float | None] = mapped_column(Numeric(2, 1))
     first_seen_at: Mapped[datetime] = mapped_column(

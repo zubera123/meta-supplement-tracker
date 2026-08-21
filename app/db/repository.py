@@ -120,7 +120,7 @@ class ScanRepository:
                 else None
             )
             latest_stats = ReviewStats(
-                source="Trustpilot",
+                source=advertiser.latest_trustpilot_review_source or "Trustpilot",
                 review_count=advertiser.latest_trustpilot_review_count,
                 rating=trust_score,
                 trust_score=trust_score,
@@ -341,6 +341,7 @@ class ScanRepository:
             advertiser.trustpilot_matched_domain = stats.matched_domain
             advertiser.trustpilot_last_refreshed_at = result.refreshed_at
             advertiser.latest_trustpilot_review_count = stats.review_count
+            advertiser.latest_trustpilot_review_source = stats.source
             advertiser.latest_trustpilot_trust_score = stats.trust_score
             advertiser.latest_trustpilot_stars = stats.star_score
             return

@@ -372,6 +372,17 @@ def test_review_columns_receive_numeric_count_and_source() -> None:
     assert api.rows[1][8:10] == [425, "Trustpilot"]
 
 
+def test_apify_review_columns_receive_numeric_count_and_source() -> None:
+    api = FakeSheetsApi(rows=[list(SHEET_HEADERS)])
+    reviewed = candidate().model_copy(
+        update={"review_count": 425, "review_source": "Trustpilot via Apify"}
+    )
+
+    provider(api).sync_candidates([reviewed], {})
+
+    assert api.rows[1][8:10] == [425, "Trustpilot via Apify"]
+
+
 def test_unavailable_review_preserves_existing_valid_review_values() -> None:
     api = FakeSheetsApi(
         rows=[
