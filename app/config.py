@@ -6,6 +6,11 @@ from typing import Self
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.services.relevance import (
+    DEFAULT_RELEVANCE_EXCLUDE_KEYWORDS,
+    DEFAULT_RELEVANCE_INCLUDE_KEYWORDS,
+)
+
 
 DEFAULT_CATEGORIES = (
     "vitamins,minerals,supplements,protein,whey,creatine,pre-workout,collagen,"
@@ -31,6 +36,12 @@ class Settings(BaseSettings):
 
     scan_regions: str = "UK,Europe,USA,Canada"
     supplement_categories: str = DEFAULT_CATEGORIES
+    supplement_relevance_include_keywords: str = ",".join(
+        DEFAULT_RELEVANCE_INCLUDE_KEYWORDS
+    )
+    supplement_relevance_exclude_keywords: str = ",".join(
+        DEFAULT_RELEVANCE_EXCLUDE_KEYWORDS
+    )
     target_min_monthly_spend_usd: float = Field(default=5_000, ge=0)
     target_max_monthly_spend_usd: float = Field(default=30_000, ge=0)
     target_min_instagram_followers: int = Field(default=10_000, ge=0)
@@ -92,9 +103,21 @@ class Settings(BaseSettings):
             value.strip() for value in self.supplement_categories.split(",") if value.strip()
         )
 
+    @property
+    def relevance_include_keywords(self) -> tuple[str, ...]:
+        return _comma_separated(self.supplement_relevance_include_keywords)
+
+    @property
+    def relevance_exclude_keywords(self) -> tuple[str, ...]:
+        return _comma_separated(self.supplement_relevance_exclude_keywords)
+
 
 @lru_cache
 def get_settings() -> Settings:
     """Return a cached settings instance for application-wide use."""
 
     return Settings()
+
+
+def _comma_separated(value: str) -> tuple[str, ...]:
+    return tuple(item.strip() for item in value.split(",") if item.strip())

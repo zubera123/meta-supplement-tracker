@@ -118,6 +118,8 @@ class AdvertiserObservation(Base):
     )
     instagram_followers: Mapped[int | None] = mapped_column(Integer)
     active_ad_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    supplement_relevant: Mapped[bool | None] = mapped_column()
+    relevance_reason: Mapped[str | None] = mapped_column(Text)
     observed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

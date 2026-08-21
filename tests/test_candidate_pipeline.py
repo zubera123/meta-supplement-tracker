@@ -127,22 +127,27 @@ def record(
     followers: int | None,
     observed_at: datetime,
     active_ads: int = 2,
+    name: str | None = None,
+    creative: str = "Real provider copy",
+    page_category: str | None = None,
 ) -> AdRecord:
     handle = f"brand_{page_id}"
+    page_name = name or f"Brand {page_id}"
     ads = [
         MetaAdDetails(
             ad_id=f"{page_id}-ad-{index}",
             page_id=page_id,
-            page_name=f"Brand {page_id}",
+            page_name=page_name,
             ad_delivery_start_time=observed_at - timedelta(days=index),
-            creative_bodies=["Real provider copy"],
+            creative_bodies=[creative],
+            facebook_page_category=page_category,
             matched_regions=[Region.UK],
         )
         for index in range(1, active_ads + 1)
     ]
     return AdRecord(
         brand=Brand(
-            name=f"Brand {page_id}",
+            name=page_name,
             source_id=page_id,
             instagram_handle=handle,
         ),
@@ -227,6 +232,10 @@ def test_full_pipeline_persists_and_writes_qualifying_advertiser(
             session.scalar(select(func.count()).select_from(AdvertiserObservation))
             == 1
         )
+        observation = session.scalar(select(AdvertiserObservation))
+        assert observation is not None
+        assert observation.supplement_relevant is True
+        assert observation.relevance_reason is not None
 
 
 @pytest.mark.parametrize("followers", [9_999, 100_001, None])
@@ -257,6 +266,41 @@ def test_nonqualifying_followers_are_persisted_but_not_written(
         stored = session.scalar(select(Advertiser))
         assert stored is not None
         assert stored.latest_instagram_followers == followers
+
+
+def test_irrelevant_advertiser_is_persisted_with_reason_but_not_written(
+    session_factory: sessionmaker[Session],
+) -> None:
+    item = record(
+        page_id="page-produce",
+        name="Zespri Kiwifruit",
+        creative="Fresh kiwifruit naturally high in vitamin C.",
+        page_category="Food and beverage",
+        followers=23_485,
+        observed_at=datetime(2026, 8, 21, tzinfo=UTC),
+    )
+    sheet_api = MemorySheetsApi()
+
+    result = asyncio.run(
+        CandidatePipeline(
+            settings=settings(),
+            meta_ads=FakeMetaProvider([item]),
+            persistence=ScanPersistenceService(session_factory),
+            sheets=sheets_provider(sheet_api),
+        ).run()
+    )
+
+    assert result.relevance_results[0].is_relevant is False
+    assert result.sheet_sync is not None and result.sheet_sync.appended == 0
+    assert sheet_api.rows == [list(SHEET_HEADERS)]
+    with session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(Advertiser)) == 1
+        observation = session.scalar(select(AdvertiserObservation))
+        assert observation is not None
+        assert observation.supplement_relevant is False
+        assert observation.relevance_reason == (
+            "excluded: obvious non-supplement identity keyword(s): kiwifruit"
+        )
 
 
 def test_repeated_scan_updates_same_sheet_row_and_preserves_future_values(

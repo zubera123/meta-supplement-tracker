@@ -13,7 +13,7 @@ from app.db.session import (
     create_database_engine,
     create_session_factory,
 )
-from app.models import AdRecord, SheetCandidate, SheetRowState
+from app.models import AdRecord, RelevanceResult, SheetCandidate, SheetRowState
 
 
 logger = logging.getLogger(__name__)
@@ -71,18 +71,32 @@ class ScanPersistenceService:
         except SQLAlchemyError as exc:
             raise DatabasePersistenceError("Could not create the scan-run record") from exc
 
-    def persist_success(self, scan_run_id: int, records: Sequence[AdRecord]) -> None:
+    def persist_success(
+        self,
+        scan_run_id: int,
+        records: Sequence[AdRecord],
+        relevance_results: Sequence[RelevanceResult] | None = None,
+    ) -> None:
+        if relevance_results is not None and len(relevance_results) != len(records):
+            raise DatabasePersistenceError(
+                "Relevance decisions do not match the discovered advertiser count"
+            )
         try:
             with self._session_factory.begin() as session:
                 repository = ScanRepository(session)
-                for record in records:
+                for index, record in enumerate(records):
+                    relevance = (
+                        relevance_results[index]
+                        if relevance_results is not None
+                        else None
+                    )
                     advertiser = repository.upsert_advertiser(record)
                     for ad_details in record.ads:
                         repository.upsert_ad(
                             advertiser, ad_details, seen_at=record.observed_at
                         )
                     repository.write_advertiser_observation(
-                        advertiser, scan_run_id, record
+                        advertiser, scan_run_id, record, relevance
                     )
                 repository.complete_scan_run(
                     scan_run_id,
@@ -109,14 +123,24 @@ class ScanPersistenceService:
         *,
         minimum_followers: int,
         maximum_followers: int,
+        relevance_results: Sequence[RelevanceResult] | None = None,
     ) -> tuple[list[SheetCandidate], dict[int, SheetRowState]]:
         """Load stable IDs and original first-seen dates from PostgreSQL."""
 
+        if relevance_results is not None and len(relevance_results) != len(records):
+            raise DatabasePersistenceError(
+                "Relevance decisions do not match the discovered advertiser count"
+            )
         try:
             with self._session_factory() as session:
                 repository = ScanRepository(session)
                 candidates: list[SheetCandidate] = []
-                for record in records:
+                for index, record in enumerate(records):
+                    if (
+                        relevance_results is not None
+                        and not relevance_results[index].is_relevant
+                    ):
+                        continue
                     followers = (
                         record.social_stats.instagram_followers
                         if record.social_stats is not None

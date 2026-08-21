@@ -13,7 +13,7 @@ from app.db.models import (
     ScanRun,
     utc_now,
 )
-from app.models import AdRecord, MetaAdDetails, SheetRowState
+from app.models import AdRecord, MetaAdDetails, RelevanceResult, SheetRowState
 
 
 class ScanRepository:
@@ -191,6 +191,7 @@ class ScanRepository:
         advertiser: Advertiser,
         scan_run_id: int,
         record: AdRecord,
+        relevance: RelevanceResult | None = None,
     ) -> AdvertiserObservation:
         followers = (
             record.social_stats.instagram_followers
@@ -202,6 +203,10 @@ class ScanRepository:
             scan_run_id=scan_run_id,
             instagram_followers=followers,
             active_ad_count=record.active_ad_count or 0,
+            supplement_relevant=(
+                relevance.is_relevant if relevance is not None else None
+            ),
+            relevance_reason=relevance.reason if relevance is not None else None,
             observed_at=record.observed_at,
         )
         self.session.add(observation)

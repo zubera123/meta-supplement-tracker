@@ -17,7 +17,14 @@ from app.db import (
     ScanPersistenceService,
 )
 from app.logging_config import configure_logging
-from app.models import AdRecord, Brand, BrandCandidate, ReviewStats, SocialStats
+from app.models import (
+    AdRecord,
+    Brand,
+    BrandCandidate,
+    RelevanceResult,
+    ReviewStats,
+    SocialStats,
+)
 from app.services import ProviderConfigurationError, ProviderError, TransientProviderError
 from app.services.google_docs import BrandOutputProvider
 from app.services.google_sheets import GoogleSheetsProvider, SheetSyncResult
@@ -28,6 +35,7 @@ from app.services.meta_ads import (
     MetaAdsProvider,
 )
 from app.services.reviews import ReviewsProvider
+from app.services.relevance import SupplementRelevanceFilter
 from app.services.scoring import CandidateScorer
 from app.services.scoring import instagram_follower_filter
 
@@ -127,6 +135,7 @@ class CandidatePipelineResult:
     """Results from one discovery, persistence, and Sheet synchronization run."""
 
     records: Sequence[AdRecord]
+    relevance_results: Sequence[RelevanceResult]
     scan_run_id: int | None
     sheet_sync: SheetSyncResult | None
 
@@ -141,6 +150,7 @@ class CandidatePipeline:
         meta_ads: MetaAdsProvider,
         persistence: ScanPersistenceService | None,
         sheets: GoogleSheetsProvider | None,
+        relevance_filter: SupplementRelevanceFilter | None = None,
     ) -> None:
         if sheets is not None and persistence is None:
             raise ProviderConfigurationError(
@@ -150,6 +160,7 @@ class CandidatePipeline:
         self.meta_ads = meta_ads
         self.persistence = persistence
         self.sheets = sheets
+        self.relevance_filter = relevance_filter or SupplementRelevanceFilter()
 
     async def run(self) -> CandidatePipelineResult:
         """Execute once; paid Meta retrieval is intentionally invoked only once."""
@@ -169,9 +180,23 @@ class CandidatePipeline:
                 regions=self.settings.regions,
                 categories=self.settings.categories,
             )
+            relevance_results = tuple(
+                self.relevance_filter.evaluate(record) for record in records
+            )
+            for record, relevance in zip(
+                records, relevance_results, strict=True
+            ):
+                if not relevance.is_relevant:
+                    logger.info(
+                        "Advertiser excluded from candidate output: %s",
+                        relevance.reason,
+                        extra={"advertiser": record.brand.name},
+                    )
             if self.persistence is not None and scan_run_id is not None:
-                # Every advertiser is persisted before the follower filter is applied.
-                self.persistence.persist_success(scan_run_id, records)
+                # Every advertiser is persisted before output filters are applied.
+                self.persistence.persist_success(
+                    scan_run_id, records, relevance_results
+                )
 
             sheet_sync: SheetSyncResult | None = None
             if self.sheets is not None and self.persistence is not None:
@@ -179,10 +204,13 @@ class CandidatePipeline:
                     records,
                     minimum_followers=self.settings.target_min_instagram_followers,
                     maximum_followers=self.settings.target_max_instagram_followers,
+                    relevance_results=relevance_results,
                 )
                 sheet_sync = self.sheets.sync_candidates(candidates, row_states)
                 self.persistence.save_sheet_row_states(sheet_sync.row_states)
-            return CandidatePipelineResult(records, scan_run_id, sheet_sync)
+            return CandidatePipelineResult(
+                records, relevance_results, scan_run_id, sheet_sync
+            )
         except Exception as exc:
             if self.persistence is not None and scan_run_id is not None:
                 self.persistence.record_failure(scan_run_id, exc)
@@ -221,6 +249,10 @@ async def _run_scan_command(settings: Settings, *, require_full_outputs: bool) -
             meta_ads=provider,
             persistence=persistence,
             sheets=sheets,
+            relevance_filter=SupplementRelevanceFilter(
+                include_keywords=settings.relevance_include_keywords,
+                exclude_keywords=settings.relevance_exclude_keywords,
+            ),
         ).run()
         output = _build_meta_only_output(result.records, settings)
         output["persistence"] = {
@@ -232,6 +264,14 @@ async def _run_scan_command(settings: Settings, *, require_full_outputs: bool) -
             "enabled": sheets is not None,
             "appended": result.sheet_sync.appended if result.sheet_sync else 0,
             "updated": result.sheet_sync.updated if result.sheet_sync else 0,
+        }
+        output["relevance_filter"] = {
+            "relevant": sum(
+                decision.is_relevant for decision in result.relevance_results
+            ),
+            "excluded": sum(
+                not decision.is_relevant for decision in result.relevance_results
+            ),
         }
         print(json.dumps(output, indent=2))
         return 0

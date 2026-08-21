@@ -145,3 +145,12 @@ class SheetRowState(BaseModel):
     last_exported_brand: str = Field(min_length=1)
     last_exported_region: str | None = None
     last_exported_instagram: str | None = None
+
+
+class RelevanceResult(BaseModel):
+    """Internal deterministic relevance decision for one advertiser observation."""
+
+    is_relevant: bool
+    reason: str = Field(min_length=1, max_length=2000)
+    matched_include_keywords: list[str] = Field(default_factory=list)
+    matched_exclude_keywords: list[str] = Field(default_factory=list)

@@ -11,6 +11,7 @@ No external-data integration is simulated. The Apify Actor supplies linked Insta
 - Typed domain models for brands, ads, social data, reviews, and candidates
 - Apify Actor discovery for active commercial ads in the UK, supported EU countries, USA, and Canada
 - Optional advertiser-page enrichment with linked Instagram username and follower count
+- Conservative keyword relevance filtering from real advertiser and ad text
 - PostgreSQL scan history with advertiser/ad upserts and follower observations
 - Idempotent Google Sheets candidate output backed by PostgreSQL advertiser identity
 - Alembic-managed database schema using SQLAlchemy 2.x and psycopg 3
@@ -70,6 +71,8 @@ Settings are loaded from environment variables and, for local development, `.env
 | `PORT` | `8000`; Railway supplies this in production |
 | `SCAN_REGIONS` | `UK,Europe,USA,Canada` |
 | `SUPPLEMENT_CATEGORIES` | Comma-separated broad supplement categories |
+| `SUPPLEMENT_RELEVANCE_INCLUDE_KEYWORDS` | Comma-separated supplement signals; defaults cover supplements, sports nutrition, wellness, and pet supplements |
+| `SUPPLEMENT_RELEVANCE_EXCLUDE_KEYWORDS` | Comma-separated obvious non-supplement signals such as produce, personal care, mineral specimens, apparel, and equipment |
 | `TARGET_MIN_MONTHLY_SPEND_USD` | `5000` |
 | `TARGET_MAX_MONTHLY_SPEND_USD` | `30000` |
 | `TARGET_MIN_INSTAGRAM_FOLLOWERS` | `10000` |
@@ -139,7 +142,7 @@ railway ssh -- python -m app.jobs.brand_scan --check-db
 
 The connectivity command prints only `{"database": "reachable"}` and never prints the connection URL. Migrations are intentionally explicit rather than being run during every web-service startup.
 
-With persistence enabled, scan commands verify the database before any paid Apify Actor start. A run creates a `scan_runs` row, upserts advertisers by Meta page ID and ads by Meta ad ID, writes one advertiser observation per scan, then records its counts. Provider, persistence, or output failures mark the scan failed when the database remains writable. An unavailable or missing database aborts clearly; results are never silently discarded. The JSON output includes the persisted scan-run ID.
+With persistence enabled, scan commands verify the database before any paid Apify Actor start. A run creates a `scan_runs` row, upserts advertisers by Meta page ID and ads by Meta ad ID, writes one advertiser observation per scan—including its relevance decision and reason—then records its counts. Provider, persistence, or output failures mark the scan failed when the database remains writable. An unavailable or missing database aborts clearly; results are never silently discarded. The JSON output includes the persisted scan-run ID.
 
 ## Google Sheets candidate output
 
@@ -195,7 +198,7 @@ After PostgreSQL, Apify, and Google Sheets are configured, run:
 python -m app.jobs.brand_scan --run-once
 ```
 
-This command performs exactly one discovery run: Apify aggregates and deduplicates ads by advertiser, all returned advertisers/ads/observations are persisted, known Instagram follower counts are filtered inclusively from 10,000 through 100,000, and qualifying advertisers are synchronized to their PostgreSQL-mapped Sheet rows. Unknown and out-of-range follower counts remain in PostgreSQL but are not written to the Sheet. Spend and review cells remain blank for new rows, while repeat updates touch only columns A–F and preserve existing values in G–J.
+This command performs exactly one discovery run: Apify aggregates and deduplicates ads by advertiser, the deterministic supplement relevance filter evaluates real provider-returned text, all returned advertisers/ads/observations and relevance reasons are persisted, known Instagram follower counts are filtered inclusively from 10,000 through 100,000, and qualifying relevant advertisers are synchronized to their PostgreSQL-mapped Sheet rows. Irrelevant, unknown-follower, and out-of-range advertisers remain in PostgreSQL but are not written to the Sheet. Spend and review cells remain blank for new rows, while repeat updates touch only columns A–F and preserve existing values in G–J.
 
 Database and Sheets connectivity are checked before paid discovery. The pipeline invokes the Meta provider once; Apify's paid Actor start retains its no-automatic-retry behavior, while the existing monthly budget and `maxTotalChargeUsd` guards remain active. Any persistence or Sheets failure is surfaced and the scan run is marked failed when PostgreSQL remains writable.
 
@@ -206,6 +209,26 @@ railway ssh -- env SCAN_REGIONS=UK APIFY_MAX_RESULTS_PER_QUERY=20 APIFY_INCLUDE_
 ```
 
 The command performs one country run with at most 20 enriched results and a server-side `$0.03` run ceiling. Do not run it until a paid live validation is explicitly approved. `--meta-only` remains available for discovery diagnostics and uses persistence or Sheets only when their respective flags are enabled.
+
+### Supplement relevance rules
+
+The relevance filter uses no LLM and makes no external calls. It normalizes and searches only the advertiser/page name, Facebook page category, page About text, and real creative body, caption, description, title, and CTA text returned by the configured Meta provider.
+
+The rules deliberately favor recall:
+
+1. If an obvious exclusion keyword appears in the advertiser name or page category and no supplement include keyword appears in that same identity text, exclude the advertiser. This prevents a produce advertiser from passing merely because its ad mentions a nutrient.
+2. Otherwise, if any include keyword appears in the available identity, About, or creative text, include it.
+3. Otherwise, if an exclusion keyword appears elsewhere in the available text, exclude it.
+4. If neither kind of signal appears, keep the ambiguous advertiser rather than guessing that it is irrelevant.
+
+Default include terms cover supplements, vitamins, multivitamins, mineral supplements, protein, whey, creatine, pre-workout, collagen, gummies, electrolytes, greens powders, probiotics, omega 3, magnesium, wellness supplements, pet/dog/cat supplements, sports/gym nutrition, amino acids, BCAA, hydration powder, meal replacements, nutrition shakes, and fish oil. Default exclusions cover explicit produce businesses, restaurants/food delivery, hair/skin care and cosmetics, mineral specimens/gemstones/jewellery, clothing/apparel, and gym equipment. Both lists are environment-configurable. Matching uses normalized whole words or phrases, not substrings.
+
+Excluded advertisers are still upserted with all ads and follower observations. PostgreSQL stores `supplement_relevant` and `relevance_reason` on each observation. Apply migration `20260821_0003` before the first filtered production run:
+
+```bash
+railway ssh -- alembic upgrade head
+railway ssh -- alembic current
+```
 
 ## Apify Meta ads provider
 
