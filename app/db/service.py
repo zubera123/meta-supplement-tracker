@@ -7,6 +7,7 @@ from sqlalchemy import Engine, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.db.locks import ScanExecutionLock, ScanLockError, try_acquire_scan_lock
 from app.db.repository import ScanRepository
 from app.db.session import (
     DatabaseConfigurationError,
@@ -62,6 +63,15 @@ class ScanPersistenceService:
                 "Database connection failed; verify DATABASE_URL, the Railway "
                 "reference variable, and PostgreSQL service health"
             ) from exc
+
+    def try_acquire_scan_lock(self) -> ScanExecutionLock | None:
+        """Try to exclude every other scheduled or manual full scan."""
+
+        if self._engine is None:
+            raise ScanLockError(
+                "Candidate scan overlap protection requires a database engine"
+            )
+        return try_acquire_scan_lock(self._engine)
 
     def create_scan_run(self, regions: Sequence[str]) -> int:
         try:

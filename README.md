@@ -14,6 +14,7 @@ No external-data integration is simulated. The Apify Actor supplies linked Insta
 - Conservative keyword relevance filtering from real advertiser and ad text
 - PostgreSQL scan history with advertiser/ad upserts and follower observations
 - Idempotent Google Sheets candidate output backed by PostgreSQL advertiser identity
+- Railway Cron Job entry point with PostgreSQL-backed overlap protection
 - Alembic-managed database schema using SQLAlchemy 2.x and psycopg 3
 - Official Meta Ad Library API discovery retained as a UK/EU alternative
 - Cursor pagination, bounded transient retries, ad deduplication, and advertiser aggregation
@@ -78,7 +79,7 @@ Settings are loaded from environment variables and, for local development, `.env
 | `TARGET_MIN_INSTAGRAM_FOLLOWERS` | `10000` |
 | `TARGET_MAX_INSTAGRAM_FOLLOWERS` | `100000` |
 | `DESIRABLE_TRUSTPILOT_REVIEW_COUNT` | `300` |
-| `SCAN_INTERVAL_HOURS` | `12` |
+| `SCAN_INTERVAL_HOURS` | `12`; descriptive application setting—the Railway Cron expression controls production timing |
 | `PROVIDER_RETRY_ATTEMPTS` | `3` |
 | `DATABASE_URL` | Required only when persistence is enabled; reference Railway PostgreSQL's `DATABASE_URL` |
 | `PERSIST_SCAN_RESULTS` | `false`; must be `true` for the complete `--run-once` pipeline |
@@ -209,6 +210,66 @@ railway ssh -- env SCAN_REGIONS=UK APIFY_MAX_RESULTS_PER_QUERY=20 APIFY_INCLUDE_
 ```
 
 The command performs one country run with at most 20 enriched results and a server-side `$0.03` run ceiling. Do not run it until a paid live validation is explicitly approved. `--meta-only` remains available for discovery diagnostics and uses persistence or Sheets only when their respective flags are enabled.
+
+## Automated production scans on Railway
+
+Railway Cron Jobs are the scheduling layer; the FastAPI service remains a separate, continuously running web service. The scanner does not contain an in-process timer or loop. Railway's current [Cron Jobs documentation](https://docs.railway.com/cron-jobs) says scheduled services run their configured start command, must exit when complete, use five-field UTC cron expressions, and skip a scheduled launch while the previous Railway execution is still active. Railway also notes that execution can vary by a few minutes, so the schedule is not an absolute-to-the-minute guarantee.
+
+Use a second Railway service in the existing production environment with this configuration:
+
+| Setting | Value |
+| --- | --- |
+| Service name | `meta-supplement-tracker-scan` |
+| Source | The same private GitHub repository and `main` branch |
+| Config File | `/railway.cron.json` |
+| Start command | `python -m app.jobs.brand_scan --run-once` (supplied by the config file) |
+| Cron Schedule | `0 0,12 * * *` |
+| Restart policy | `NEVER` (supplied by the config file) |
+| Public domain | None |
+
+The expression runs every day at **00:00 UTC** and **12:00 UTC**. Railway evaluates the schedule in UTC, including when the UK changes between GMT and BST. The dedicated config file uses the existing Dockerfile but deliberately has no HTTP health check because a Cron Job runs to completion and exits; it does not replace or modify the web service's `railway.json` or `/health` behavior. `NEVER` prevents Railway process-level restarts from accidentally repeating a paid job after a non-zero exit.
+
+### Create the Cron Job in the Railway UI
+
+1. Open the existing project and select the `production` environment.
+2. Select **+ New → GitHub Repo**, choose the same private `meta-supplement-tracker` repository, and name the new service `meta-supplement-tracker-scan`.
+3. In the new service's **Settings**, confirm the source branch is `main`, then set **Config File** to `/railway.cron.json`. This custom file is supported by Railway's [Config as Code documentation](https://docs.railway.com/config-as-code).
+4. In **Settings → Cron Schedule**, enter `0 0,12 * * *`.
+5. In **Variables**, use **Add Reference Variable** to reference the existing production app service's values. Reference variables are documented by Railway and avoid copying secrets. The Cron service needs the same values for:
+
+   - `APP_ENV`, `LOG_LEVEL`, `SCAN_REGIONS`, `SUPPLEMENT_CATEGORIES`
+   - `SUPPLEMENT_RELEVANCE_INCLUDE_KEYWORDS`, `SUPPLEMENT_RELEVANCE_EXCLUDE_KEYWORDS`
+   - `TARGET_MIN_INSTAGRAM_FOLLOWERS`, `TARGET_MAX_INSTAGRAM_FOLLOWERS`
+   - `PROVIDER_RETRY_ATTEMPTS`, `PROVIDER_RETRY_MIN_WAIT_SECONDS`, `PROVIDER_RETRY_MAX_WAIT_SECONDS`
+   - `DATABASE_URL`, `PERSIST_SCAN_RESULTS`, `DATABASE_CONNECT_TIMEOUT_SECONDS`
+   - `META_AD_PROVIDER`, `APIFY_API_TOKEN`, `APIFY_ACTOR_ID`, `APIFY_MAX_RESULTS_PER_QUERY`
+   - `APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN`, `APIFY_INCLUDE_ADVERTISER_DETAILS`, `APIFY_MONTHLY_BUDGET_GBP`, `APIFY_BUDGET_GBP_PER_USD`, `APIFY_REQUEST_TIMEOUT_SECONDS`
+   - `GOOGLE_SHEETS_ENABLED`, `GOOGLE_SHEET_ID`, `GOOGLE_SHEET_TAB`, `GOOGLE_SERVICE_ACCOUNT_JSON`
+
+   The production values must still make `PERSIST_SCAN_RESULTS=true` and `GOOGLE_SHEETS_ENABLED=true`; `--run-once` fails closed otherwise. Do not give the Cron service a public domain.
+6. Review Railway's staged service and variable changes, then deploy the Cron service. No paid scan runs at deploy time; the command runs only at the next scheduled execution or an explicitly requested manual execution.
+
+The application adds a second overlap guard beyond Railway's own active-execution skip. Before building the provider or starting Apify, every `--run-once` process calls PostgreSQL `pg_try_advisory_lock` with one application-owned key. If another scheduled or manual full scan holds the lock, the invocation logs `status=overlap`, exits successfully, and makes no paid provider call. The session lock is explicitly released after both success and failure. PostgreSQL also cleans it up when the database session ends, including an ungraceful disconnect, so there is no persistent stale-lock row to expire.
+
+Every acquired run creates its `scan_runs` row before the Sheets preflight. Logs identify the actual UTC invocation time, scan-run ID, success/failure status, ads found, advertisers found, candidates written, and failure reason. Provider errors are logged without credential values. A database outage cannot be recorded in that unavailable database, but it fails before Apify starts.
+
+To run one protected scan manually, use:
+
+```bash
+railway ssh -- python -m app.jobs.brand_scan --run-once
+```
+
+To disable automation without changing application code, clear **Cron Schedule** in the `meta-supplement-tracker-scan` service's Settings. Manual `--run-once` remains available and still uses the same PostgreSQL lock. To inspect history without exposing connection credentials, use Railway's PostgreSQL query interface with this read-only query:
+
+```sql
+SELECT id, started_at, finished_at, status, regions,
+       ads_found, advertisers_found, error_message
+FROM scan_runs
+ORDER BY started_at DESC
+LIMIT 50;
+```
+
+Runtime logs are available from the Cron service's deployment/execution history. Do not run `railway variables` when collecting diagnostics because it may display unsealed values.
 
 ### Supplement relevance rules
 
@@ -409,7 +470,7 @@ Provider contracts live under `app/services/`. Implementations normalize verifie
 
 `BrandScanJob` accepts provider instances through its constructor. A run retrieves advertisers for every configured region and category, enriches each brand with Instagram and optional review data, evaluates it, and writes the complete qualifying set to the output provider. Provider calls that raise `TransientProviderError` use bounded exponential retries. Configuration and programming errors fail immediately. A failed optional enrichment is logged and treated as unavailable; retrieval and output failures abort the run so failures remain visible.
 
-The 12-hour interval is configuration only. No in-process scheduler is started. Once all providers are implemented, invoke the scan from a Railway cron service or add a dedicated worker/scheduler; avoid running a scheduler in every web replica.
+Production scheduling is provided by the separate Railway Cron Job described above. The FastAPI process never starts a scheduler, and horizontal web replicas therefore cannot multiply scheduled scans.
 
 ## Railway deployment preparation
 
@@ -435,6 +496,5 @@ No Railway deployment is performed by this project setup.
 - EU countries absent from the current SolidCode Actor country schema
 - Instagram profile URL, because the current Actor does not document one
 - Trustpilot or other reviews enrichment; the corresponding Sheet columns intentionally remain blank
-- Scheduled invocation of the scan job
 
 Each is intentionally left behind an interface rather than returning fabricated data. Provider choice must be validated against official documentation, access requirements, terms, and available fields before implementation.

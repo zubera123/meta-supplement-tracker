@@ -6,6 +6,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TypeVar
 
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -14,6 +15,7 @@ from app.config import Settings, get_settings
 from app.db import (
     DatabaseConfigurationError,
     DatabasePersistenceError,
+    ScanLockError,
     ScanPersistenceService,
 )
 from app.logging_config import configure_logging
@@ -169,13 +171,19 @@ class CandidatePipeline:
         if self.persistence is not None:
             # Fail before any paid provider call when persistence is unavailable.
             self.persistence.verify_connection()
-        if self.sheets is not None:
-            # Fail before any paid provider call when output cannot be reached.
-            self.sheets.ensure_ready()
 
         try:
             if self.persistence is not None:
                 scan_run_id = self.persistence.create_scan_run(self.settings.regions)
+                logger.info(
+                    "Candidate scan created status=running scan_run_id=%s regions=%s",
+                    scan_run_id,
+                    ",".join(self.settings.regions),
+                )
+            if self.sheets is not None:
+                # Fail before any paid provider call; because the scan-run row now
+                # exists, a failed output preflight is recorded durably.
+                self.sheets.ensure_ready()
             records = await self.meta_ads.retrieve_advertisers(
                 regions=self.settings.regions,
                 categories=self.settings.categories,
@@ -208,10 +216,28 @@ class CandidatePipeline:
                 )
                 sheet_sync = self.sheets.sync_candidates(candidates, row_states)
                 self.persistence.save_sheet_row_states(sheet_sync.row_states)
+            ads_found = sum(len(record.ads) for record in records)
+            candidates_written = (
+                sheet_sync.appended + sheet_sync.updated if sheet_sync else 0
+            )
+            logger.info(
+                "Candidate scan completed status=succeeded scan_run_id=%s "
+                "ads_found=%s advertisers_found=%s candidates_written=%s",
+                scan_run_id,
+                ads_found,
+                len(records),
+                candidates_written,
+            )
             return CandidatePipelineResult(
                 records, relevance_results, scan_run_id, sheet_sync
             )
         except Exception as exc:
+            logger.exception(
+                "Candidate scan completed status=failed scan_run_id=%s "
+                "failure_reason=%s",
+                scan_run_id,
+                exc,
+            )
             if self.persistence is not None and scan_run_id is not None:
                 self.persistence.record_failure(scan_run_id, exc)
             raise
@@ -219,6 +245,7 @@ class CandidatePipeline:
 
 async def _run_scan_command(settings: Settings, *, require_full_outputs: bool) -> int:
     persistence: ScanPersistenceService | None = None
+    scan_lock = None
     try:
         if require_full_outputs and not settings.persist_scan_results:
             raise ProviderConfigurationError(
@@ -238,6 +265,32 @@ async def _run_scan_command(settings: Settings, *, require_full_outputs: bool) -
                 settings.database_url,
                 connect_timeout_seconds=settings.database_connect_timeout_seconds,
             )
+        if require_full_outputs:
+            if persistence is None:
+                raise ProviderConfigurationError(
+                    "PostgreSQL persistence is required for scan overlap protection"
+                )
+            started_at = datetime.now(UTC).isoformat()
+            logger.info(
+                "Candidate scan invocation started scheduled_start_time_utc=%s",
+                started_at,
+            )
+            scan_lock = persistence.try_acquire_scan_lock()
+            if scan_lock is None:
+                logger.warning(
+                    "Candidate scan skipped status=overlap "
+                    "scheduled_start_time_utc=%s",
+                    started_at,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "status": "skipped",
+                            "reason": "another candidate scan is already running",
+                        }
+                    )
+                )
+                return 0
         sheets = (
             _build_sheets_provider(settings)
             if settings.google_sheets_enabled
@@ -276,8 +329,13 @@ async def _run_scan_command(settings: Settings, *, require_full_outputs: bool) -
         print(json.dumps(output, indent=2))
         return 0
     finally:
-        if persistence is not None:
-            persistence.close()
+        try:
+            if scan_lock is not None:
+                scan_lock.release()
+                logger.info("Released PostgreSQL candidate scan lock")
+        finally:
+            if persistence is not None:
+                persistence.close()
 
 
 async def _run_meta_only(settings: Settings) -> int:
@@ -449,6 +507,7 @@ def main() -> int:
         ProviderError,
         DatabaseConfigurationError,
         DatabasePersistenceError,
+        ScanLockError,
     ) as exc:
         logger.error("Command failed: %s", exc)
         return 1

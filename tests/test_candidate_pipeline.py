@@ -93,6 +93,11 @@ class FailingSheetsProvider:
         raise ProviderError("Google Sheets write failed")
 
 
+class FailingSheetsPreflightProvider:
+    def ensure_ready(self) -> None:
+        raise ProviderError("Google Sheets preflight failed")
+
+
 class UnavailablePersistence:
     def verify_connection(self) -> None:
         raise DatabaseUnavailableError("database unavailable")
@@ -402,6 +407,29 @@ def test_database_failure_is_surfaced_before_meta_or_sheets() -> None:
         )
 
     assert provider.calls == 0
+
+
+def test_sheets_preflight_failure_is_recorded_before_paid_meta_call(
+    session_factory: sessionmaker[Session],
+) -> None:
+    provider = FakeMetaProvider([])
+
+    with pytest.raises(ProviderError, match="Google Sheets preflight failed"):
+        asyncio.run(
+            CandidatePipeline(
+                settings=settings(),
+                meta_ads=provider,
+                persistence=ScanPersistenceService(session_factory),
+                sheets=FailingSheetsPreflightProvider(),  # type: ignore[arg-type]
+            ).run()
+        )
+
+    assert provider.calls == 0
+    with session_factory() as session:
+        scan_run = session.scalar(select(ScanRun))
+        assert scan_run is not None
+        assert scan_run.status == "failed"
+        assert "Google Sheets preflight failed" in (scan_run.error_message or "")
 
 
 def test_paid_provider_failure_is_not_retried(
