@@ -78,7 +78,7 @@ Settings are loaded from environment variables and, for local development, `.env
 | `SCAN_INTERVAL_HOURS` | `12` |
 | `PROVIDER_RETRY_ATTEMPTS` | `3` |
 | `DATABASE_URL` | Required only when persistence is enabled; reference Railway PostgreSQL's `DATABASE_URL` |
-| `PERSIST_SCAN_RESULTS` | `false`; set to `true` to persist `--meta-only` scans |
+| `PERSIST_SCAN_RESULTS` | `false`; must be `true` for the complete `--run-once` pipeline |
 | `DATABASE_CONNECT_TIMEOUT_SECONDS` | `10`; fail-closed connection timeout before paid discovery starts |
 | `META_ACCESS_TOKEN` | Required only when `META_AD_PROVIDER=meta_ad_library` |
 | `META_AD_PROVIDER` | `apify` for the primary provider; `meta_ad_library` remains available |
@@ -139,11 +139,11 @@ railway ssh -- python -m app.jobs.brand_scan --check-db
 
 The connectivity command prints only `{"database": "reachable"}` and never prints the connection URL. Migrations are intentionally explicit rather than being run during every web-service startup.
 
-With persistence enabled, `python -m app.jobs.brand_scan --meta-only` verifies the database before any paid Apify Actor start. It creates a `scan_runs` row, upserts advertisers by Meta page ID and ads by Meta ad ID, writes one advertiser observation per scan, then marks the scan successful with its counts. Provider or persistence failures mark the scan failed when the database remains writable. An unavailable or missing database aborts clearly; results are never silently discarded. The JSON output includes the persisted scan-run ID.
+With persistence enabled, scan commands verify the database before any paid Apify Actor start. A run creates a `scan_runs` row, upserts advertisers by Meta page ID and ads by Meta ad ID, writes one advertiser observation per scan, then records its counts. Provider, persistence, or output failures mark the scan failed when the database remains writable. An unavailable or missing database aborts clearly; results are never silently discarded. The JSON output includes the persisted scan-run ID.
 
 ## Google Sheets candidate output
 
-Google Sheets output is optional and is used only by `--meta-only`. It requires `PERSIST_SCAN_RESULTS=true`: PostgreSQL remains the source of stable advertiser identity, the original first-seen date, and the row mapping. The spreadsheet receives no hidden identity column, metadata tab, or second application-created tab.
+Google Sheets output requires `PERSIST_SCAN_RESULTS=true`: PostgreSQL remains the source of stable advertiser identity, the original first-seen date, and the row mapping. The spreadsheet receives no hidden identity column, metadata tab, or second application-created tab. The complete `--run-once` command fails closed unless both persistence and Sheets output are enabled.
 
 The configured tab contains exactly these visible columns:
 
@@ -186,6 +186,26 @@ The check creates only the configured `Candidates` tab and its exact header when
 For local use, put the same four variables in the untracked `.env` file and run `python -m app.jobs.brand_scan --check-sheets`. If access is denied, confirm that the Sheets API is enabled in the credential's project and that the spreadsheet—not merely a similarly named Drive file—was shared with the exact service-account email as Editor.
 
 The implementation uses the documented Sheets API v4 [spreadsheet structure updates](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets/batchUpdate) and [values batch updates](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values/batchUpdate). Its retry policy follows Google's [Sheets API quota guidance](https://developers.google.com/workspace/sheets/api/limits): rate limits and transient server responses use bounded exponential backoff.
+
+### Run the complete pipeline once
+
+After PostgreSQL, Apify, and Google Sheets are configured, run:
+
+```bash
+python -m app.jobs.brand_scan --run-once
+```
+
+This command performs exactly one discovery run: Apify aggregates and deduplicates ads by advertiser, all returned advertisers/ads/observations are persisted, known Instagram follower counts are filtered inclusively from 10,000 through 100,000, and qualifying advertisers are synchronized to their PostgreSQL-mapped Sheet rows. Unknown and out-of-range follower counts remain in PostgreSQL but are not written to the Sheet. Spend and review cells remain blank for new rows, while repeat updates touch only columns A–F and preserve existing values in G–J.
+
+Database and Sheets connectivity are checked before paid discovery. The pipeline invokes the Meta provider once; Apify's paid Actor start retains its no-automatic-retry behavior, while the existing monthly budget and `maxTotalChargeUsd` guards remain active. Any persistence or Sheets failure is surfaced and the scan run is marked failed when PostgreSQL remains writable.
+
+For a future safe production validation, use this exact UK-only, 20-result command after reviewing the current Actor pricing and account usage:
+
+```bash
+railway ssh -- env SCAN_REGIONS=UK APIFY_MAX_RESULTS_PER_QUERY=20 APIFY_INCLUDE_ADVERTISER_DETAILS=true APIFY_MAX_TOTAL_CHARGE_USD_PER_RUN=0.03 python -m app.jobs.brand_scan --run-once
+```
+
+The command performs one country run with at most 20 enriched results and a server-side `$0.03` run ceiling. Do not run it until a paid live validation is explicitly approved. `--meta-only` remains available for discovery diagnostics and uses persistence or Sheets only when their respective flags are enabled.
 
 ## Apify Meta ads provider
 

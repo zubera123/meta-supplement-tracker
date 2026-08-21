@@ -1,10 +1,11 @@
-"""Brand scan orchestration and a manual Meta-only discovery command."""
+"""Brand scan orchestration and explicit one-run CLI commands."""
 
 import argparse
 import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from typing import TypeVar
 
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -121,12 +122,84 @@ class BrandScanJob:
         return qualifying
 
 
-async def _run_meta_only(settings: Settings) -> int:
+@dataclass(frozen=True)
+class CandidatePipelineResult:
+    """Results from one discovery, persistence, and Sheet synchronization run."""
+
+    records: Sequence[AdRecord]
+    scan_run_id: int | None
+    sheet_sync: SheetSyncResult | None
+
+
+class CandidatePipeline:
+    """Run the real candidate pipeline once using configured provider services."""
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        meta_ads: MetaAdsProvider,
+        persistence: ScanPersistenceService | None,
+        sheets: GoogleSheetsProvider | None,
+    ) -> None:
+        if sheets is not None and persistence is None:
+            raise ProviderConfigurationError(
+                "Google Sheets output requires PostgreSQL persistence"
+            )
+        self.settings = settings
+        self.meta_ads = meta_ads
+        self.persistence = persistence
+        self.sheets = sheets
+
+    async def run(self) -> CandidatePipelineResult:
+        """Execute once; paid Meta retrieval is intentionally invoked only once."""
+
+        scan_run_id: int | None = None
+        if self.persistence is not None:
+            # Fail before any paid provider call when persistence is unavailable.
+            self.persistence.verify_connection()
+        if self.sheets is not None:
+            # Fail before any paid provider call when output cannot be reached.
+            self.sheets.ensure_ready()
+
+        try:
+            if self.persistence is not None:
+                scan_run_id = self.persistence.create_scan_run(self.settings.regions)
+            records = await self.meta_ads.retrieve_advertisers(
+                regions=self.settings.regions,
+                categories=self.settings.categories,
+            )
+            if self.persistence is not None and scan_run_id is not None:
+                # Every advertiser is persisted before the follower filter is applied.
+                self.persistence.persist_success(scan_run_id, records)
+
+            sheet_sync: SheetSyncResult | None = None
+            if self.sheets is not None and self.persistence is not None:
+                candidates, row_states = self.persistence.prepare_sheet_candidates(
+                    records,
+                    minimum_followers=self.settings.target_min_instagram_followers,
+                    maximum_followers=self.settings.target_max_instagram_followers,
+                )
+                sheet_sync = self.sheets.sync_candidates(candidates, row_states)
+                self.persistence.save_sheet_row_states(sheet_sync.row_states)
+            return CandidatePipelineResult(records, scan_run_id, sheet_sync)
+        except Exception as exc:
+            if self.persistence is not None and scan_run_id is not None:
+                self.persistence.record_failure(scan_run_id, exc)
+            raise
+
+
+async def _run_scan_command(settings: Settings, *, require_full_outputs: bool) -> int:
     persistence: ScanPersistenceService | None = None
-    sheets: GoogleSheetsProvider | None = None
-    sheet_sync: SheetSyncResult | None = None
-    scan_run_id: int | None = None
     try:
+        if require_full_outputs and not settings.persist_scan_results:
+            raise ProviderConfigurationError(
+                "PERSIST_SCAN_RESULTS=true is required for --run-once"
+            )
+        if require_full_outputs and not settings.google_sheets_enabled:
+            raise ProviderConfigurationError(
+                "GOOGLE_SHEETS_ENABLED=true is required for --run-once"
+            )
         if settings.google_sheets_enabled and not settings.persist_scan_results:
             raise ProviderConfigurationError(
                 "PERSIST_SCAN_RESULTS=true is required for Google Sheets output "
@@ -137,52 +210,46 @@ async def _run_meta_only(settings: Settings) -> int:
                 settings.database_url,
                 connect_timeout_seconds=settings.database_connect_timeout_seconds,
             )
-            # Fail before any paid provider call when persistence is required
-            # but the configured database is unavailable.
-            persistence.verify_connection()
-
-        if settings.google_sheets_enabled:
-            sheets = _build_sheets_provider(settings)
-            # Authenticate and verify/create the tab and headers before a paid run.
-            sheets.ensure_ready()
-
-        provider = _build_meta_provider(settings)
-        if persistence is not None:
-            scan_run_id = persistence.create_scan_run(settings.regions)
-        records = await provider.retrieve_advertisers(
-            regions=settings.regions,
-            categories=settings.categories,
+        sheets = (
+            _build_sheets_provider(settings)
+            if settings.google_sheets_enabled
+            else None
         )
-        if persistence is not None and scan_run_id is not None:
-            persistence.persist_success(scan_run_id, records)
-        if sheets is not None and persistence is not None:
-            candidates, row_states = persistence.prepare_sheet_candidates(
-                records,
-                minimum_followers=settings.target_min_instagram_followers,
-                maximum_followers=settings.target_max_instagram_followers,
-            )
-            sheet_sync = sheets.sync_candidates(candidates, row_states)
-            persistence.save_sheet_row_states(sheet_sync.row_states)
-        output = _build_meta_only_output(records, settings)
+        provider = _build_meta_provider(settings)
+        result = await CandidatePipeline(
+            settings=settings,
+            meta_ads=provider,
+            persistence=persistence,
+            sheets=sheets,
+        ).run()
+        output = _build_meta_only_output(result.records, settings)
         output["persistence"] = {
             "enabled": persistence is not None,
-            "scan_run_id": scan_run_id,
+            "scan_run_id": result.scan_run_id,
             "status": "succeeded" if persistence is not None else "disabled",
         }
         output["google_sheets"] = {
             "enabled": sheets is not None,
-            "appended": sheet_sync.appended if sheet_sync else 0,
-            "updated": sheet_sync.updated if sheet_sync else 0,
+            "appended": result.sheet_sync.appended if result.sheet_sync else 0,
+            "updated": result.sheet_sync.updated if result.sheet_sync else 0,
         }
         print(json.dumps(output, indent=2))
         return 0
-    except Exception as exc:
-        if persistence is not None and scan_run_id is not None:
-            persistence.record_failure(scan_run_id, exc)
-        raise
     finally:
         if persistence is not None:
             persistence.close()
+
+
+async def _run_meta_only(settings: Settings) -> int:
+    """Run discovery with persistence and Sheets when their flags are enabled."""
+
+    return await _run_scan_command(settings, require_full_outputs=False)
+
+
+async def _run_once(settings: Settings) -> int:
+    """Run the complete production candidate pipeline exactly once."""
+
+    return await _run_scan_command(settings, require_full_outputs=True)
 
 
 def _build_meta_provider(settings: Settings) -> MetaAdsProvider:
@@ -214,7 +281,7 @@ def _build_meta_provider(settings: Settings) -> MetaAdsProvider:
             retry_max_wait_seconds=settings.provider_retry_max_wait_seconds,
         )
     raise ProviderError(
-        f"Unsupported META_AD_PROVIDER for --meta-only: {settings.meta_ad_provider}"
+        f"Unsupported META_AD_PROVIDER for scan command: {settings.meta_ad_provider}"
     )
 
 
@@ -307,9 +374,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Meta Supplement Tracker scan utilities")
     commands = parser.add_mutually_exclusive_group(required=True)
     commands.add_argument(
+        "--run-once",
+        action="store_true",
+        help="Run one full Meta, PostgreSQL, follower-filter, and Sheets pipeline",
+    )
+    commands.add_argument(
         "--meta-only",
         action="store_true",
-        help="Run documented Meta Ad Library discovery without other enrichments",
+        help="Run Meta discovery with only the outputs enabled by configuration",
     )
     commands.add_argument(
         "--check-db",
@@ -330,6 +402,8 @@ def main() -> int:
             return _check_database(settings)
         if args.check_sheets:
             return _check_sheets(settings)
+        if args.run_once:
+            return asyncio.run(_run_once(settings))
         return asyncio.run(_run_meta_only(settings))
     except (
         ProviderError,
