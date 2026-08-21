@@ -31,7 +31,14 @@ def record(page: str, *, domain: str | None, followers: int | None = 20_000,
     )
 
 
-RELEVANT = RelevanceResult(is_relevant=True, reason="supplement")
+RELEVANT = RelevanceResult(
+    is_relevant=True, has_positive_evidence=True, reason="supplement"
+)
+AMBIGUOUS = RelevanceResult(
+    is_relevant=True,
+    has_positive_evidence=False,
+    reason="ambiguous: no positive supplement evidence",
+)
 
 
 def persist(service: ScanPersistenceService, items: list[AdRecord], decisions=None,
@@ -68,6 +75,49 @@ def test_conflicting_or_missing_domains_never_merge_by_name() -> None:
     persist(service, items)
     with sessions() as session:
         assert session.scalar(select(func.count()).select_from(Company)) == 4
+
+
+def test_ambiguous_evidence_uses_three_complete_scan_lifecycle() -> None:
+    sessions = factory()
+    service = ScanPersistenceService(sessions)
+    base = datetime(2026, 8, 1, tzinfo=UTC)
+    persist(
+        service,
+        [record("lifecycle", domain="lifecycle.example", when=base)],
+        [RELEVANT],
+    )
+
+    for day in (2, 3):
+        item = record(
+            "lifecycle", domain="lifecycle.example", when=base + timedelta(days=day)
+        )
+        persist(service, [item], [AMBIGUOUS], complete=True)
+        with sessions() as session:
+            assert session.scalar(select(Company.sheet_eligible)) is True
+
+    final = record(
+        "lifecycle", domain="lifecycle.example", when=base + timedelta(days=4)
+    )
+    persist(service, [final], [AMBIGUOUS], complete=True)
+
+    with sessions() as session:
+        company = session.scalar(select(Company))
+        assert company is not None
+        assert company.sheet_eligible is False
+        assert company.consecutive_disqualifications == 3
+
+
+def test_ambiguous_new_company_is_persisted_but_not_sheet_eligible() -> None:
+    sessions = factory()
+    service = ScanPersistenceService(sessions)
+    item = record("ambiguous", domain="ambiguous.example")
+
+    persist(service, [item], [AMBIGUOUS])
+
+    with sessions() as session:
+        company = session.scalar(select(Company))
+        assert company is not None
+        assert company.sheet_eligible is False
 
 
 def test_missing_observation_breaks_consecutive_explicit_failures() -> None:

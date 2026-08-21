@@ -83,6 +83,11 @@ DEFAULT_RELEVANCE_EXCLUDE_KEYWORDS: tuple[str, ...] = (
     "gym equipment",
 )
 
+# Generic nutrient words in creative copy can describe ordinary food. They are
+# positive when part of the page identity, but need another include signal when
+# they occur only in ad/About copy.
+_CREATIVE_ONLY_WEAK_INCLUDE_KEYWORDS = frozenset({"vitamin", "vitamins"})
+
 
 class SupplementRelevanceFilter:
     """Exclude only clear non-supplement advertisers using provider-returned text."""
@@ -107,6 +112,7 @@ class SupplementRelevanceFilter:
         if identity_excludes and not identity_includes:
             return RelevanceResult(
                 is_relevant=False,
+                has_positive_evidence=False,
                 reason=(
                     "excluded: obvious non-supplement identity keyword(s): "
                     + ", ".join(identity_excludes)
@@ -114,9 +120,16 @@ class SupplementRelevanceFilter:
                 matched_include_keywords=all_includes,
                 matched_exclude_keywords=all_excludes,
             )
-        if all_includes:
+        strong_includes = [
+            keyword
+            for keyword in all_includes
+            if keyword not in _CREATIVE_ONLY_WEAK_INCLUDE_KEYWORDS
+            or keyword in identity_includes
+        ]
+        if strong_includes:
             return RelevanceResult(
                 is_relevant=True,
+                has_positive_evidence=True,
                 reason=(
                     "included: supplement keyword(s): " + ", ".join(all_includes)
                 ),
@@ -126,15 +139,27 @@ class SupplementRelevanceFilter:
         if all_excludes:
             return RelevanceResult(
                 is_relevant=False,
+                has_positive_evidence=False,
                 reason=(
                     "excluded: obvious non-supplement keyword(s): "
                     + ", ".join(all_excludes)
                 ),
                 matched_exclude_keywords=all_excludes,
             )
+        if all_includes:
+            return RelevanceResult(
+                is_relevant=True,
+                has_positive_evidence=False,
+                reason=(
+                    "ambiguous: generic nutrient keyword(s) without positive "
+                    "supplement/product identity: " + ", ".join(all_includes)
+                ),
+                matched_include_keywords=all_includes,
+            )
         return RelevanceResult(
             is_relevant=True,
-            reason="included: no decisive relevance or exclusion keyword matched",
+            has_positive_evidence=False,
+            reason="ambiguous: no positive supplement keyword or explicit exclusion matched",
         )
 
 

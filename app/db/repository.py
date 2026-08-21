@@ -254,6 +254,29 @@ class ScanRepository:
             for row in rows
         }
 
+    def all_sheet_row_states(
+        self, spreadsheet_id: str, sheet_tab: str
+    ) -> dict[int, SheetRowState]:
+        rows = self.session.scalars(
+            select(GoogleSheetRow)
+            .where(GoogleSheetRow.spreadsheet_id == spreadsheet_id)
+            .where(GoogleSheetRow.sheet_tab == sheet_tab)
+        ).all()
+        return {
+            row.company_id: SheetRowState(
+                company_id=row.company_id,
+                spreadsheet_id=row.spreadsheet_id,
+                sheet_tab=row.sheet_tab,
+                row_number=row.row_number,
+                developer_metadata_id=row.developer_metadata_id,
+                last_exported_first_seen=row.last_exported_first_seen,
+                last_exported_brand=row.last_exported_brand,
+                last_exported_region=row.last_exported_region,
+                last_exported_instagram=row.last_exported_instagram,
+            )
+            for row in rows
+        }
+
     def upsert_sheet_row_state(self, state: SheetRowState) -> GoogleSheetRow:
         row = self.session.scalar(
             select(GoogleSheetRow).where(

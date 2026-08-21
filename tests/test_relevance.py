@@ -42,6 +42,7 @@ def test_obvious_supplement_brand_passes() -> None:
     )
 
     assert result.is_relevant is True
+    assert result.has_positive_evidence is True
     assert "magnesium" in result.matched_include_keywords
 
 
@@ -92,9 +93,34 @@ def test_unknown_ambiguous_advertiser_is_not_aggressively_rejected() -> None:
     )
 
     assert result.is_relevant is True
+    assert result.has_positive_evidence is False
     assert result.matched_include_keywords == []
     assert result.matched_exclude_keywords == []
-    assert result.reason == "included: no decisive relevance or exclusion keyword matched"
+    assert result.reason == (
+        "ambiguous: no positive supplement keyword or explicit exclusion matched"
+    )
+
+
+def test_generic_vitamin_food_copy_is_ambiguous_without_product_evidence() -> None:
+    result = SupplementRelevanceFilter().evaluate(
+        advertiser(
+            name="Purina ONE",
+            creative="Natural nutrition with essential vitamins and nutrients.",
+        )
+    )
+
+    assert result.is_relevant is True
+    assert result.has_positive_evidence is False
+    assert result.matched_include_keywords == ["vitamins"]
+
+
+def test_vitamin_in_page_identity_is_positive_evidence() -> None:
+    result = SupplementRelevanceFilter().evaluate(
+        advertiser(name="Daily Vitamins", creative="Support your routine.")
+    )
+
+    assert result.is_relevant is True
+    assert result.has_positive_evidence is True
 
 
 def test_keywords_are_configurable() -> None:

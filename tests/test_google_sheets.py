@@ -93,6 +93,7 @@ class FakeSheetsApi:
         self.batch_value_updates: list[list[dict[str, Any]]] = []
         self.metadata: dict[int, tuple[int, int]] = {}
         self.next_metadata_id = 1
+        self.table: dict[str, Any] | None = None
 
     def get_spreadsheet(self, spreadsheet_id: str) -> dict[str, Any]:
         assert spreadsheet_id == SPREADSHEET_ID
@@ -104,7 +105,8 @@ class FakeSheetsApi:
                         "sheetId": 7,
                         "title": TAB,
                         "gridProperties": {"rowCount": self.row_count},
-                    }
+                    },
+                    "tables": [self.table] if self.table else [],
                 }
             )
         return {"spreadsheetId": spreadsheet_id, "sheets": sheets}
@@ -140,6 +142,15 @@ class FakeSheetsApi:
             return {"replies": [{"createDeveloperMetadata": {"developerMetadata": {
                 **item, "metadataId": metadata_id,
             }}}]}
+        if "addTable" in request:
+            self.table = dict(request["addTable"]["table"])
+            return {"replies": [{} for _ in body["requests"]]}
+        if "updateTable" in request:
+            assert self.table is not None
+            self.table["range"] = request["updateTable"]["table"]["range"]
+            return {"replies": [{}]}
+        if "updateSheetProperties" in request:
+            return {"replies": [{} for _ in body["requests"]]}
         if "deleteDimension" in request:
             for operation in body["requests"]:
                 start = operation["deleteDimension"]["range"]["startIndex"]
@@ -504,6 +515,79 @@ def test_check_sheets_only_verifies_sheet_access(monkeypatch, capsys) -> None:
     }
 
 
+def test_reconcile_sheet_command_never_constructs_meta_provider(
+    monkeypatch, capsys
+) -> None:
+    state = row_state()
+
+    class Lock:
+        released = False
+
+        def release(self) -> None:
+            self.released = True
+
+    lock = Lock()
+
+    class Persistence:
+        def verify_connection(self) -> None:
+            return None
+
+        def try_acquire_scan_lock(self) -> Lock:
+            return lock
+
+        def load_all_sheet_row_states(self, *_: object) -> dict[int, SheetRowState]:
+            return {1: state}
+
+        def save_sheet_row_states(self, states: object) -> None:
+            assert tuple(states) == (state,)
+
+        def close(self) -> None:
+            return None
+
+    class ReconcileProvider:
+        def ensure_ready(self) -> None:
+            return None
+
+        def reconcile_managed_rows(self, states: object) -> object:
+            assert states == {1: state}
+            return type("Result", (), {
+                "row_states": (state,),
+                "metadata_attached": 1,
+                "metadata_existing": 0,
+                "table_id": "table-id",
+                "table_created": True,
+                "table_resized": False,
+            })()
+
+    monkeypatch.setattr(
+        brand_scan.ScanPersistenceService,
+        "from_database_url",
+        lambda *args, **kwargs: Persistence(),
+    )
+    monkeypatch.setattr(
+        brand_scan, "_build_sheets_provider", lambda settings: ReconcileProvider()
+    )
+    monkeypatch.setattr(
+        brand_scan,
+        "_build_meta_provider",
+        lambda settings: pytest.fail("Meta provider must not be constructed"),
+    )
+    settings = Settings(
+        _env_file=None,
+        persist_scan_results=True,
+        google_sheets_enabled=True,
+        google_sheet_id=SPREADSHEET_ID,
+        google_sheet_tab=TAB,
+    )
+
+    assert brand_scan._reconcile_sheet(settings) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["meta_provider_called"] is False
+    assert output["actor_started"] is False
+    assert output["visible_values_changed"] is False
+    assert lock.released is True
+
+
 def test_developer_metadata_follows_manual_sort_and_updates_correct_company() -> None:
     api = FakeSheetsApi(rows=[list(SHEET_HEADERS)])
     sheets = provider(api)
@@ -538,3 +622,85 @@ def test_stale_deletion_uses_invisible_metadata_after_inserted_row() -> None:
     assert len(api.rows) == 2
     assert api.rows[1][0] == "manual"
     assert 1 not in api.metadata
+
+
+def test_reconcile_attaches_metadata_to_untouched_managed_row_once() -> None:
+    api = FakeSheetsApi(rows=[list(SHEET_HEADERS), [
+        "2026-08-01", "Example Supplements", "UK", "@example_supplements"
+    ]])
+    sheets = provider(api)
+
+    first = sheets.reconcile_managed_rows({1: row_state()})
+    second = sheets.reconcile_managed_rows({1: first.row_states[0]})
+
+    assert first.metadata_attached == 1
+    assert second.metadata_attached == 0
+    assert second.metadata_existing == 1
+    assert len(api.metadata) == 1
+    assert api.batch_value_updates == []
+
+
+def test_reconcile_repairs_stale_physical_row_after_manual_move() -> None:
+    api = FakeSheetsApi(rows=[
+        list(SHEET_HEADERS),
+        ["manual", "unmanaged"],
+        ["2026-08-01", "Example Supplements", "UK", "@example_supplements"],
+    ])
+
+    result = provider(api).reconcile_managed_rows({1: row_state(row_number=2)})
+
+    assert result.row_states[0].row_number == 3
+    assert api.metadata[1][1] == 3
+    assert len(api.rows) == 3
+
+
+def test_metadata_remains_authoritative_after_row_move() -> None:
+    api = FakeSheetsApi(rows=[
+        list(SHEET_HEADERS),
+        ["manual", "unmanaged"],
+        ["2026-08-01", "Example Supplements", "UK", "@example_supplements"],
+    ])
+    api.metadata[1] = (91, 3)
+
+    result = provider(api).reconcile_managed_rows({1: row_state(row_number=2)})
+
+    assert result.row_states[0].row_number == 3
+    assert result.row_states[0].developer_metadata_id == 91
+    assert result.metadata_attached == 0
+
+
+def test_reconcile_refuses_two_companies_on_one_visible_row() -> None:
+    api = FakeSheetsApi(rows=[list(SHEET_HEADERS), [
+        "2026-08-01", "Example Supplements", "UK", "@example_supplements"
+    ]])
+
+    with pytest.raises(ProviderError, match="same visible Sheet row"):
+        provider(api).reconcile_managed_rows(
+            {1: row_state(advertiser_id=1), 2: row_state(advertiser_id=2)}
+        )
+
+    assert len(api.rows) == 2
+
+
+def test_native_table_is_idempotent_and_expands_over_exact_columns() -> None:
+    api = FakeSheetsApi(rows=[list(SHEET_HEADERS)])
+    sheets = provider(api)
+
+    first = sheets.reconcile_managed_rows({})
+    api.rows.extend([["", ""] for _ in range(3)])
+    second = sheets.reconcile_managed_rows({})
+
+    assert first.table_created is True
+    assert second.table_created is False
+    assert second.table_resized is True
+    assert api.table is not None
+    assert api.table["range"]["startColumnIndex"] == 0
+    assert api.table["range"]["endColumnIndex"] == 10
+    assert api.table["range"]["endRowIndex"] == 4
+    add_requests = [
+        request
+        for body in api.structure_updates
+        for request in body["requests"]
+        if "addTable" in request
+    ]
+    assert len(add_requests) == 1

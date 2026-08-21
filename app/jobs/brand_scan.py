@@ -266,6 +266,12 @@ class CandidatePipeline:
 
             sheet_sync: SheetSyncResult | None = None
             if self.sheets is not None and self.persistence is not None:
+                managed_states = self.persistence.load_all_sheet_row_states(
+                    self.settings.google_sheet_id or "",
+                    self.settings.google_sheet_tab,
+                )
+                reconciliation = self.sheets.reconcile_managed_rows(managed_states)
+                self.persistence.save_sheet_row_states(reconciliation.row_states)
                 candidates, row_states = self.persistence.prepare_sheet_candidates(
                     records,
                     minimum_followers=self.settings.target_min_instagram_followers,
@@ -343,7 +349,7 @@ class CandidatePipeline:
             )
             review_eligible = (
                 relevance_results is None
-                or relevance_results[index].is_relevant
+                or relevance_results[index].has_positive_evidence
             ) and (
                 followers is not None
                 and self.settings.target_min_instagram_followers
@@ -647,6 +653,61 @@ def _check_sheets(settings: Settings) -> int:
     return 0
 
 
+def _reconcile_sheet(settings: Settings) -> int:
+    """Reconcile every managed row and native table without invoking Apify."""
+
+    if not settings.persist_scan_results:
+        raise ProviderConfigurationError(
+            "PERSIST_SCAN_RESULTS=true is required for Sheet reconciliation"
+        )
+    if not settings.google_sheets_enabled:
+        raise ProviderConfigurationError(
+            "GOOGLE_SHEETS_ENABLED=true is required for Sheet reconciliation"
+        )
+    persistence = ScanPersistenceService.from_database_url(
+        settings.database_url,
+        connect_timeout_seconds=settings.database_connect_timeout_seconds,
+    )
+    scan_lock = None
+    try:
+        persistence.verify_connection()
+        scan_lock = persistence.try_acquire_scan_lock()
+        if scan_lock is None:
+            raise ScanLockError(
+                "Another candidate scan holds the PostgreSQL advisory lock"
+            )
+        provider = _build_sheets_provider(settings)
+        provider.ensure_ready()
+        states = persistence.load_all_sheet_row_states(
+            settings.google_sheet_id or "", settings.google_sheet_tab
+        )
+        result = provider.reconcile_managed_rows(states)
+        persistence.save_sheet_row_states(result.row_states)
+    finally:
+        if scan_lock is not None:
+            scan_lock.release()
+        persistence.close()
+    print(
+        json.dumps(
+            {
+                "spreadsheet": "reachable",
+                "tab": settings.google_sheet_tab,
+                "managed_rows": len(result.row_states),
+                "metadata_attached": result.metadata_attached,
+                "metadata_existing": result.metadata_existing,
+                "native_table_id": result.table_id,
+                "native_table_created": result.table_created,
+                "native_table_resized": result.table_resized,
+                "visible_values_changed": False,
+                "meta_provider_called": False,
+                "actor_started": False,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 async def _check_reviews(settings: Settings) -> int:
     provider = _build_reviews_provider(settings)
     try:
@@ -806,6 +867,13 @@ def main() -> int:
         help="Verify Google Sheets access, tab, headers, and Editor permission",
     )
     commands.add_argument(
+        "--reconcile-sheet",
+        action="store_true",
+        help=(
+            "Reconcile all PostgreSQL Sheet mappings and the native table without Apify"
+        ),
+    )
+    commands.add_argument(
         "--estimate-spend-dry-run",
         action="store_true",
         help="Estimate spend from existing PostgreSQL data without calling Apify",
@@ -824,6 +892,8 @@ def main() -> int:
             return _check_database(settings)
         if args.check_sheets:
             return _check_sheets(settings)
+        if args.reconcile_sheet:
+            return _reconcile_sheet(settings)
         if args.estimate_spend_dry_run:
             return _estimate_spend_dry_run(settings)
         if args.check_reviews:

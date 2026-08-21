@@ -38,9 +38,20 @@ _REQUIRED_CREDENTIAL_FIELDS = frozenset(
 
 
 @dataclass(frozen=True)
+class NativeTable:
+    table_id: str
+    name: str
+    start_row: int
+    end_row: int
+    start_column: int
+    end_column: int
+
+
+@dataclass(frozen=True)
 class SheetInfo:
     sheet_id: int
     row_count: int
+    table: NativeTable | None = None
 
 
 @dataclass(frozen=True)
@@ -51,6 +62,16 @@ class SheetSyncResult:
     row_states: tuple[SheetRowState, ...]
     removed: int = 0
     removed_company_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class SheetReconciliationResult:
+    row_states: tuple[SheetRowState, ...]
+    metadata_attached: int
+    metadata_existing: int
+    table_id: str
+    table_created: bool
+    table_resized: bool
 
 
 class SheetsApi(Protocol):
@@ -157,7 +178,10 @@ class GoogleSheetsApiClient:
         return self._execute(
             lambda: self._service.spreadsheets().get(
                 spreadsheetId=spreadsheet_id,
-                fields="spreadsheetId,sheets.properties(sheetId,title,gridProperties(rowCount))",
+                fields=(
+                    "spreadsheetId,sheets(properties(sheetId,title,gridProperties(rowCount)),"
+                    "tables(tableId,name,range,columnProperties))"
+                ),
             ),
             "read spreadsheet",
         )
@@ -323,9 +347,6 @@ class GoogleSheetsProvider:
             key: value for key, value in (removals or {}).items()
             if key not in unique_candidates
         }
-        if not unique_candidates and not removals:
-            return SheetSyncResult(0, 0, excluded, ())
-
         all_range = f"{_a1_tab(self._sheet_tab)}!A:J"
         response = self._api.get_values(self._spreadsheet_id, all_range)
         raw_rows = response.get("values")
@@ -344,6 +365,10 @@ class GoogleSheetsProvider:
         appended = 0
         updated = 0
         metadata = self._metadata_rows(sheet_info.sheet_id)
+
+        if not unique_candidates and not removals:
+            self._ensure_native_table(max(2, len(rows)))
+            return SheetSyncResult(0, 0, excluded, ())
 
         for candidate in unique_candidates.values():
             state = row_states.get(candidate.company_id)
@@ -422,7 +447,11 @@ class GoogleSheetsProvider:
                     ]
                 },
             )
-            self._sheet_info = SheetInfo(sheet_info.sheet_id, required_rows)
+            self._sheet_info = SheetInfo(
+                sheet_info.sheet_id, required_rows, sheet_info.table
+            )
+
+        self._ensure_native_table(max(required_rows, len(rows), 2))
 
         if updates:
             self._api.batch_update_values(self._spreadsheet_id, updates)
@@ -464,6 +493,138 @@ class GoogleSheetsProvider:
             removed=len(removed_ids),
             removed_company_ids=tuple(removed_ids),
         )
+
+    def reconcile_managed_rows(
+        self, row_states: Mapping[int, SheetRowState]
+    ) -> SheetReconciliationResult:
+        """Repair all PostgreSQL mappings without changing visible cell values."""
+
+        sheet_info = self._sheet_info or self.ensure_ready()
+        response = self._api.get_values(
+            self._spreadsheet_id, f"{_a1_tab(self._sheet_tab)}!A:J"
+        )
+        raw_rows = response.get("values")
+        rows = (
+            [_normalize_row(row) for row in raw_rows]
+            if isinstance(raw_rows, list)
+            else []
+        )
+        if not rows or tuple(str(value) for value in rows[0]) != SHEET_HEADERS:
+            raise ProviderError("Google Sheet headers changed during row reconciliation")
+
+        metadata = self._metadata_rows(sheet_info.sheet_id)
+        reconciled: list[SheetRowState] = []
+        assigned_rows: dict[int, int] = {}
+        attached = 0
+        existing = 0
+        for company_id, state in sorted(row_states.items()):
+            located = metadata.get(company_id)
+            row_number = located[1] if located else _resolve_state_row(
+                rows,
+                state,
+                spreadsheet_id=self._spreadsheet_id,
+                sheet_tab=self._sheet_tab,
+            )
+            if row_number is None:
+                raise ProviderError(
+                    "A managed Google Sheet row is missing and cannot be reconciled "
+                    "without changing visible values"
+                )
+            owner = assigned_rows.get(row_number)
+            if owner is not None and owner != company_id:
+                raise ProviderError(
+                    "Two PostgreSQL companies resolve to the same visible Sheet row"
+                )
+            assigned_rows[row_number] = company_id
+            if located:
+                metadata_id = located[0]
+                existing += 1
+            else:
+                metadata_id = self._attach_metadata(
+                    sheet_info.sheet_id, company_id, row_number
+                )
+                attached += 1
+            reconciled.append(
+                state.model_copy(
+                    update={
+                        "row_number": row_number,
+                        "developer_metadata_id": metadata_id,
+                    }
+                )
+            )
+
+        table_id, created, resized = self._ensure_native_table(max(2, len(rows)))
+        return SheetReconciliationResult(
+            row_states=tuple(reconciled),
+            metadata_attached=attached,
+            metadata_existing=existing,
+            table_id=table_id,
+            table_created=created,
+            table_resized=resized,
+        )
+
+    def _ensure_native_table(self, data_end_row: int) -> tuple[str, bool, bool]:
+        sheet_info = self._sheet_info or self.ensure_ready()
+        end_row = max(2, data_end_row)
+        table = sheet_info.table
+        created = False
+        resized = False
+        if table is None:
+            table_id = f"mst_candidates_{sheet_info.sheet_id}"
+            table_value = {
+                "tableId": table_id,
+                "name": f"CandidatesTable_{sheet_info.sheet_id}",
+                "range": {
+                    "sheetId": sheet_info.sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": end_row,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": len(SHEET_HEADERS),
+                },
+                "columnProperties": [
+                    {"columnIndex": index, "columnName": name}
+                    for index, name in enumerate(SHEET_HEADERS)
+                ],
+            }
+            self._api.batch_update_spreadsheet(
+                self._spreadsheet_id,
+                {"requests": [
+                    {"addTable": {"table": table_value}},
+                    *_sheet_layout_requests(sheet_info.sheet_id),
+                ]},
+            )
+            table = _parse_table(table_value)
+            created = True
+        elif table.end_row < end_row:
+            self._api.batch_update_spreadsheet(
+                self._spreadsheet_id,
+                {"requests": [{"updateTable": {
+                    "table": {
+                        "tableId": table.table_id,
+                        "range": {
+                            "sheetId": sheet_info.sheet_id,
+                            "startRowIndex": 0,
+                            "endRowIndex": end_row,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": len(SHEET_HEADERS),
+                        },
+                    },
+                    "fields": "range",
+                }}]},
+            )
+            table = NativeTable(
+                table.table_id, table.name, 0, end_row, 0, len(SHEET_HEADERS)
+            )
+            resized = True
+
+        if not created:
+            self._api.batch_update_spreadsheet(
+                self._spreadsheet_id,
+                {"requests": _sheet_layout_requests(sheet_info.sheet_id)},
+            )
+
+        self._sheet_info = SheetInfo(sheet_info.sheet_id, sheet_info.row_count, table)
+        return table.table_id, created, resized
 
     def _metadata_rows(self, sheet_id: int) -> dict[int, tuple[int, int]]:
         response = self._api.search_developer_metadata(
@@ -521,7 +682,25 @@ def _find_sheet(spreadsheet: dict[str, Any], title: str) -> SheetInfo | None:
         row_count = grid.get("rowCount") if isinstance(grid, dict) else None
         if not isinstance(sheet_id, int) or not isinstance(row_count, int):
             raise ProviderError("Google Sheets API returned malformed tab properties")
-        return SheetInfo(sheet_id=sheet_id, row_count=row_count)
+        raw_tables = sheet.get("tables", [])
+        if not isinstance(raw_tables, list):
+            raise ProviderError("Google Sheets API returned malformed table metadata")
+        tables = [_parse_table(item) for item in raw_tables]
+        matching = [
+            table for table in tables
+            if table.start_row == 0
+            and table.start_column == 0
+            and table.end_column == len(SHEET_HEADERS)
+        ]
+        if len(tables) > 1 or (tables and not matching):
+            raise ProviderError(
+                "The Candidates tab must contain exactly one native table over columns A:J"
+            )
+        return SheetInfo(
+            sheet_id=sheet_id,
+            row_count=row_count,
+            table=matching[0] if matching else None,
+        )
     return None
 
 
@@ -536,6 +715,56 @@ def _created_sheet_info(response: dict[str, Any]) -> SheetInfo:
     if not isinstance(sheet_id, int) or not isinstance(row_count, int):
         raise ProviderError("Google Sheets API did not return the created tab properties")
     return SheetInfo(sheet_id=sheet_id, row_count=row_count)
+
+
+def _parse_table(value: object) -> NativeTable:
+    if not isinstance(value, dict):
+        raise ProviderError("Google Sheets API returned malformed table metadata")
+    table_range = value.get("range")
+    if not isinstance(table_range, dict):
+        raise ProviderError("Google Sheets API returned a table without a range")
+    try:
+        return NativeTable(
+            table_id=str(value["tableId"]),
+            name=str(value["name"]),
+            start_row=int(table_range.get("startRowIndex", 0)),
+            end_row=int(table_range["endRowIndex"]),
+            start_column=int(table_range.get("startColumnIndex", 0)),
+            end_column=int(table_range["endColumnIndex"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ProviderError("Google Sheets API returned malformed table metadata") from exc
+
+
+def _sheet_layout_requests(sheet_id: int) -> list[dict[str, Any]]:
+    widths = (105, 220, 150, 170, 95, 95, 145, 145, 90, 150)
+    requests: list[dict[str, Any]] = [
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": sheet_id,
+                    "gridProperties": {"frozenRowCount": 1},
+                },
+                "fields": "gridProperties.frozenRowCount",
+            }
+        }
+    ]
+    requests.extend(
+        {
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": index,
+                    "endIndex": index + 1,
+                },
+                "properties": {"pixelSize": width},
+                "fields": "pixelSize",
+            }
+        }
+        for index, width in enumerate(widths)
+    )
+    return requests
 
 
 def _resolve_existing_row(

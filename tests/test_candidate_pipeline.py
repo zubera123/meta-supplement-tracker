@@ -39,6 +39,8 @@ class MemorySheetsApi:
 
     def __init__(self) -> None:
         self.rows: list[list[object]] = [list(SHEET_HEADERS)]
+        self.table: dict[str, object] | None = None
+        self.metadata: dict[int, tuple[int, int]] = {}
 
     def get_spreadsheet(self, spreadsheet_id: str) -> dict[str, Any]:
         return {
@@ -49,7 +51,8 @@ class MemorySheetsApi:
                         "sheetId": 7,
                         "title": "Candidates",
                         "gridProperties": {"rowCount": 1000},
-                    }
+                    },
+                    "tables": [self.table] if self.table else [],
                 }
             ],
         }
@@ -58,10 +61,23 @@ class MemorySheetsApi:
         self, spreadsheet_id: str, body: dict[str, Any]
     ) -> dict[str, Any]:
         request = body["requests"][0]
+        if "addTable" in request:
+            self.table = dict(request["addTable"]["table"])
+            return {"replies": [{} for _ in body["requests"]]}
+        if "updateTable" in request:
+            assert self.table is not None
+            self.table["range"] = request["updateTable"]["table"]["range"]
+            return {"replies": [{}]}
+        if "updateSheetProperties" in request:
+            return {"replies": [{} for _ in body["requests"]]}
         if "createDeveloperMetadata" in request:
             item = request["createDeveloperMetadata"]["developerMetadata"]
+            company_id = int(item["metadataValue"])
+            metadata_id = company_id
+            row = item["location"]["dimensionRange"]["startIndex"] + 1
+            self.metadata[company_id] = (metadata_id, row)
             return {"replies": [{"createDeveloperMetadata": {"developerMetadata": {
-                **item, "metadataId": int(item["metadataValue"]),
+                **item, "metadataId": metadata_id,
             }}}]}
         return {"replies": [{}]}
 
@@ -93,12 +109,24 @@ class MemorySheetsApi:
     def search_developer_metadata(
         self, spreadsheet_id: str, body: dict[str, Any]
     ) -> dict[str, Any]:
-        return {"matchedDeveloperMetadata": []}
+        return {"matchedDeveloperMetadata": [{"developerMetadata": {
+            "metadataId": metadata_id,
+            "metadataKey": "meta_supplement_tracker_company_id",
+            "metadataValue": str(company_id),
+            "visibility": "PROJECT",
+            "location": {"dimensionRange": {
+                "sheetId": 7, "dimension": "ROWS",
+                "startIndex": row - 1, "endIndex": row,
+            }},
+        }} for company_id, (metadata_id, row) in self.metadata.items()]}
 
 
 class FailingSheetsProvider:
     def ensure_ready(self) -> None:
         return None
+
+    def reconcile_managed_rows(self, row_states: object) -> object:
+        return type("Result", (), {"row_states": ()})()
 
     def sync_candidates(self, candidates: object, row_states: object, removals: object = None) -> object:
         raise ProviderError("Google Sheets write failed")
@@ -144,7 +172,7 @@ def record(
     observed_at: datetime,
     active_ads: int = 2,
     name: str | None = None,
-    creative: str = "Real provider copy",
+    creative: str = "Real supplement provider copy",
     page_category: str | None = None,
 ) -> AdRecord:
     handle = f"brand_{page_id}"

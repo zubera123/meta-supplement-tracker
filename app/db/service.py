@@ -152,8 +152,15 @@ class ScanPersistenceService:
                     company.consecutive_absent_successful_scans = 0
                     reasons: list[str] = []
                     relevances = [decision.is_relevant for _, decision in items if decision]
+                    positive_evidence = [
+                        decision.has_positive_evidence
+                        for _, decision in items
+                        if decision
+                    ]
                     if relevances and not any(relevances):
                         reasons.append("supplement relevance is false")
+                    elif positive_evidence and not any(positive_evidence):
+                        reasons.append("no positive supplement evidence")
                     followers = [
                         r.social_stats.instagram_followers for r, _ in items
                         if r.social_stats and r.social_stats.instagram_followers is not None
@@ -168,7 +175,7 @@ class ScanPersistenceService:
                         reasons.append("reliable spend estimate is outside the target range")
                     explicit = bool(reasons)
                     qualifies = (
-                        (not relevances or any(relevances))
+                        (not positive_evidence or any(positive_evidence))
                         and any(minimum_followers <= f <= maximum_followers for f in followers)
                         and not (reliable_spend and not any(value is True for value in reliable_spend))
                     )
@@ -503,6 +510,19 @@ class ScanPersistenceService:
         except SQLAlchemyError as exc:
             raise DatabasePersistenceError(
                 "Google Sheet was updated but its PostgreSQL row mappings could not be saved"
+            ) from exc
+
+    def load_all_sheet_row_states(
+        self, spreadsheet_id: str, sheet_tab: str
+    ) -> dict[int, SheetRowState]:
+        try:
+            with self._session_factory() as session:
+                return ScanRepository(session).all_sheet_row_states(
+                    spreadsheet_id, sheet_tab
+                )
+        except SQLAlchemyError as exc:
+            raise DatabasePersistenceError(
+                "Could not load managed Google Sheet row mappings"
             ) from exc
 
     def sheet_rows_to_remove(self) -> dict[int, SheetRowState]:

@@ -262,12 +262,14 @@ For the official provider, the check resolves Trustpilot's own documented domain
 
 Google Sheets output requires `PERSIST_SCAN_RESULTS=true`: PostgreSQL remains the source of canonical company identity, original first-seen date, lifecycle history, and a cached row location. The spreadsheet receives no visible identity column, metadata tab, or second application-created tab. Instead, every managed row receives project-visible Google Sheets developer metadata containing only its internal canonical-company integer ID. Google documents that row metadata follows its row through sorting, inserted rows, and moves, and is deleted with the row. The app searches that metadata on every synchronization; it never blindly trusts the cached physical row number.
 
+The provider also creates exactly one native Google Sheets Table over columns A:J, reuses it idempotently, and expands its range before new candidate rows are written. The native header remains frozen and the ten existing columns receive readable fixed widths. No values or visible columns are added by table maintenance.
+
 The configured tab contains exactly these visible columns:
 
 | First seen | Brand | Region | Instagram | Followers | Active ads | Spend est. | Spend source | Reviews | Review source |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 
-Only companies with a known Instagram follower count from 10,000 through 100,000 inclusive are written. Unknown, lower, and higher counts are excluded rather than guessed. `First seen` is the company's earliest original advertiser date in PostgreSQL. Spend estimates update columns G–H. A successful review match writes its numeric count and either `Trustpilot via Apify` or `Trustpilot` to I–J. Missing or failed review enrichment leaves those cells unchanged, preserving an earlier valid value. No visible columns are added. Unknown spend is written explicitly as `Unknown`. Writes are batched, duplicate input companies are collapsed by canonical ID, and transient HTTP 429/5xx responses use bounded exponential retries.
+Only companies with a positive supplement include-keyword match and a known Instagram follower count from 10,000 through 100,000 inclusive are eligible for a new visible row. Ambiguous records with no positive evidence and explicit exclusions remain fully persisted but cannot newly qualify. `First seen` is the company's earliest original advertiser date in PostgreSQL. Spend estimates update columns G–H. A successful review match writes its numeric count and either `Trustpilot via Apify` or `Trustpilot` to I–J. Missing or failed review enrichment leaves those cells unchanged, preserving an earlier valid value. No visible columns are added. Unknown spend is written explicitly as `Unknown`. Writes are batched, duplicate input companies are collapsed by canonical ID, and transient HTTP 429/5xx responses use bounded exponential retries.
 
 ### Company identity and stale-row policy
 
@@ -277,10 +279,18 @@ Grouped output uses the earliest first-seen date, unique ad IDs across the pages
 
 An existing Sheet row is removed only after one of these conservative rules:
 
-- `CANDIDATE_DISQUALIFY_SCANS` consecutive successful, uncapped observations explicitly show irrelevance, followers outside 10,000–100,000, or a reliable impressions/reach spend result outside the target.
+- `CANDIDATE_DISQUALIFY_SCANS` consecutive successful, uncapped observations show an explicit exclusion, no positive supplement evidence, followers outside 10,000–100,000, or a reliable impressions/reach spend result outside the target.
 - `CANDIDATE_ABSENT_DAYS` is converted to successful complete scan equivalents using `SCAN_INTERVAL_HOURS`; at the defaults, 30 days requires 60 relevant-region scans in which the company is absent.
 
-Unknown follower/spend data and mere absence in one scan are not explicit failures. Activity-model spend never disqualifies. Failed, aborted, capped, and unrelated-region scans do not advance either counter. Removal affects only the visible Sheet row; advertisers, companies, ads, observations, mappings, and qualification/removal events remain in PostgreSQL. A later qualifying observation recreates the row with the original `First seen`. The first successful post-migration sync reconciles existing visible rows through their stored visible identity, attaches developer metadata in place, and does not append duplicates.
+Unknown follower/spend data and mere absence in one scan are not explicit failures. Activity-model spend never disqualifies. Failed, aborted, capped, and unrelated-region scans do not advance either counter. Removal affects only the visible Sheet row; advertisers, companies, ads, observations, mappings, and qualification/removal events remain in PostgreSQL. A later positive qualifying observation recreates the row with the original `First seen`. Existing visible candidates that become ambiguous or excluded remain visible until the configured three successful complete observations have accumulated; new ambiguous companies never become visible.
+
+Reconcile every PostgreSQL-managed row, repair stale cached row numbers, attach missing developer metadata, and ensure the native Table without calling Apify or changing visible values:
+
+```bash
+python -m app.jobs.brand_scan --reconcile-sheet
+```
+
+This maintenance command acquires the same PostgreSQL advisory lock as a scan, validates database and Sheets access, and fails closed if a mapped visible row cannot be identified uniquely. It never constructs a Meta provider, starts an Actor, appends candidate rows, or updates cell values.
 
 ### Google Cloud and spreadsheet setup
 
@@ -315,7 +325,7 @@ The check creates only the configured `Candidates` tab and its exact header when
 
 For local use, put the same four variables in the untracked `.env` file and run `python -m app.jobs.brand_scan --check-sheets`. If access is denied, confirm that the Sheets API is enabled in the credential's project and that the spreadsheet—not merely a similarly named Drive file—was shared with the exact service-account email as Editor.
 
-The implementation uses the documented Sheets API v4 [developer metadata behavior](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.developerMetadata), [metadata search guide](https://developers.google.com/workspace/sheets/api/guides/metadata), [spreadsheet structure updates](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets/batchUpdate), and [values batch updates](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values/batchUpdate). Its retry policy follows Google's [Sheets API quota guidance](https://developers.google.com/workspace/sheets/api/limits): rate limits and transient server responses use bounded exponential backoff.
+The implementation uses the documented Sheets API v4 [Tables guide](https://developers.google.com/workspace/sheets/api/guides/tables), [Table resource](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets/sheets#table), [developer metadata behavior](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.developerMetadata), [metadata search guide](https://developers.google.com/workspace/sheets/api/guides/metadata), [spreadsheet structure updates](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets/batchUpdate), and [values batch updates](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values/batchUpdate). Its retry policy follows Google's [Sheets API quota guidance](https://developers.google.com/workspace/sheets/api/limits): rate limits and transient server responses use bounded exponential backoff.
 
 ### Run the complete pipeline once
 
@@ -406,13 +416,13 @@ The relevance filter uses no LLM and makes no external calls. It normalizes and 
 The rules deliberately favor recall:
 
 1. If an obvious exclusion keyword appears in the advertiser name or page category and no supplement include keyword appears in that same identity text, exclude the advertiser. This prevents a produce advertiser from passing merely because its ad mentions a nutrient.
-2. Otherwise, if any include keyword appears in the available identity, About, or creative text, include it.
+2. Otherwise, if a positive include keyword appears in the available identity, About, or creative text, include it. The generic words `vitamin`/`vitamins` are positive in the page identity, but creative-only use needs another supplement/product include signal because ordinary food ads also make vitamin claims.
 3. Otherwise, if an exclusion keyword appears elsewhere in the available text, exclude it.
-4. If neither kind of signal appears, keep the ambiguous advertiser rather than guessing that it is irrelevant.
+4. If neither kind of signal appears, classify the advertiser as ambiguous: retain it in PostgreSQL, but do not treat it as positive evidence for visible Sheet eligibility.
 
 Default include terms cover supplements, vitamins, multivitamins, mineral supplements, protein, whey, creatine, pre-workout, collagen, gummies, electrolytes, greens powders, probiotics, omega 3, magnesium, wellness supplements, pet/dog/cat supplements, sports/gym nutrition, amino acids, BCAA, hydration powder, meal replacements, nutrition shakes, and fish oil. Default exclusions cover explicit produce businesses, restaurants/food delivery, hair/skin care and cosmetics, mineral specimens/gemstones/jewellery, clothing/apparel, and gym equipment. Both lists are environment-configurable. Matching uses normalized whole words or phrases, not substrings.
 
-Excluded advertisers are still upserted with all ads and follower observations. PostgreSQL stores `supplement_relevant` and `relevance_reason` on each observation. Apply migration `20260821_0003` before the first filtered production run:
+Excluded and ambiguous advertisers are still upserted with all ads and follower observations. PostgreSQL stores the relevance decision and reason on each observation; the company lifecycle stores `no positive supplement evidence` as its internal disqualification reason where applicable. Apply migration `20260821_0003` before the first filtered production run:
 
 ```bash
 railway ssh -- alembic upgrade head

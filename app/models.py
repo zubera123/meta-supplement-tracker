@@ -223,6 +223,7 @@ class RelevanceResult(BaseModel):
     """Internal deterministic relevance decision for one advertiser observation."""
 
     is_relevant: bool
+    has_positive_evidence: bool = False
     reason: str = Field(min_length=1, max_length=2000)
     matched_include_keywords: list[str] = Field(default_factory=list)
     matched_exclude_keywords: list[str] = Field(default_factory=list)
